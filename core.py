@@ -322,6 +322,14 @@ class ServerMonitor:
                 "Type=simple\n"
                 "User=root\n"
                 f"ExecStart={VENV_PY} -u {AGENT_PATH} {int(ws_port)}\n"
+                # 🔧 نسخه ۴.۳: ایجنت با اولویت پایین اجرا می‌شود و حداکثر ۶۰٪
+                # از CPU را می‌گیرد. روی نودهایی که ربات هم همان‌جاست، این خط
+                # جلوی خوابیدن کل ماشین موقع تست کانفیگ را می‌گیرد.
+                "Nice=15\n"
+                "IOSchedulingClass=idle\n"
+                "CPUWeight=20\n"
+                f"CPUQuota={os.getenv('SONAR_AGENT_CPU_QUOTA', '60%')}\n"
+                "Environment=SONAR_AGENT_MAX_TESTS=3\n"
                 "Restart=always\n"
                 "RestartSec=3\n\n"
                 "[Install]\n"

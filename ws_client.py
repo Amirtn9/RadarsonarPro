@@ -153,6 +153,7 @@ class WebSocketPool:
                 last_err = "timeout"
                 if conn:
                     await self._dispose(conn)
+                    conn = None  # 🔧 v4.3: جلوگیری از dispose دوباره در finally
             except InvalidStatusCode as e:
                 # Common misconfig: nginx / web server returns HTTP 200 instead of WS 101
                 code = getattr(e, 'status_code', None)
@@ -171,20 +172,29 @@ class WebSocketPool:
                     logger.error("WS handshake failed with HTTP status: %s", code)
                 if conn:
                     await self._dispose(conn)
+                    conn = None
             except ConnectionClosed as e:
                 last_err = f"connection_closed: {e}"
                 if conn:
                     await self._dispose(conn)
+                    conn = None
             except OSError as e:
                 last_err = f"os_error: {e}"
                 if conn:
                     await self._dispose(conn)
+                    conn = None
             except Exception as e:
                 last_err = f"ws_error: {e}"
                 if conn:
                     await self._dispose(conn)
+                    conn = None
             finally:
-                if conn and conn.is_open:
+                # 🔧 v4.3: conn در شاخه‌های except روی None ست می‌شود.
+                # قبلاً اگر کانکشن تایم‌اوت می‌خورد، هم در except و هم اینجا
+                # dispose می‌شد و شمارنده _counts دو بار کم می‌شد؛ نتیجه این بود
+                # که استخر فکر می‌کرد جا دارد و بیشتر از max_per_key کانکشن
+                # به ایجنت می‌زد — یعنی دقیقاً همان سیلی که نود ایران را می‌خواباند.
+                if conn is not None:
                     self._release(conn)
 
             # retry with exponential backoff (+ jitter)

@@ -2,7 +2,7 @@ import os
 import logging
 import json
 
-PROJECT_VERSION = "4.2"
+PROJECT_VERSION = "4.3"
 
 # ==============================================================================
 # 📂 FILE PATHS CONFIGURATION
@@ -98,11 +98,13 @@ DOWN_RETRY_LIMIT = 3
 
 # 🔧 نسخه ۴.۲: همه‌ی کاربرها به یک نود مانیتورینگ وصل می‌شوند، یعنی یک
 # کلید استخر مشترک. با سقف ۵، نفر ششم ۳۰ ثانیه صبر می‌کرد و خطا می‌گرفت.
-WS_POOL_MAX_PER_KEY = int(os.getenv("SONAR_WS_POOL_MAX", "20"))
+WS_POOL_MAX_PER_KEY = int(os.getenv("SONAR_WS_POOL_MAX", "10"))
 WS_OPEN_TIMEOUT = float(os.getenv("SONAR_WS_OPEN_TIMEOUT", "6"))
 WS_CLOSE_TIMEOUT = float(os.getenv("SONAR_WS_CLOSE_TIMEOUT", "6"))
-WS_PING_INTERVAL = float(os.getenv("SONAR_WS_PING_INTERVAL", "20"))
-WS_PING_TIMEOUT = float(os.getenv("SONAR_WS_PING_TIMEOUT", "20"))
+WS_PING_INTERVAL = float(os.getenv("SONAR_WS_PING_INTERVAL", "30"))
+# 🔧 v4.3: زیر بار سنگین ایجنت دیر به ping جواب می‌دهد؛ با ۲۰ ثانیه
+# همه‌ی کانکشن‌ها با هم بسته می‌شدند و چرخه‌ی reconnect راه می‌افتاد.
+WS_PING_TIMEOUT = float(os.getenv("SONAR_WS_PING_TIMEOUT", "90"))
 WS_ACQUIRE_TIMEOUT = float(os.getenv("SONAR_WS_ACQUIRE_TIMEOUT", "45"))
 
 # اگر خروجی ایجنت بزرگ است (مثلاً تست ساب)، max_size=None بهترین گزینه است.

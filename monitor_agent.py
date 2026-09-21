@@ -12,6 +12,7 @@ import random
 import socket
 import math
 import shlex
+import shutil
 import argparse
 import asyncio
 from datetime import datetime, timedelta
@@ -360,6 +361,24 @@ def parse_xray_config(link):
     except Exception as e:
         advanced_log(f"parse_xray_config error: {e}", "PARSE")
         return None
+# 🔧 نسخه ۴.۳: تست‌ها با اولویت پایین اجرا می‌شوند.
+# روی نود ایران، xray و curl نباید با پروسه‌های مهم (ربات، دیتابیس، sshd)
+# سر CPU و I/O رقابت کنند. nice=+15 یعنی «هر وقت CPU بیکار بود».
+def _lowprio_prefix():
+    prefix = []
+    if shutil.which("nice"):
+        prefix += ["nice", "-n", "15"]
+    if shutil.which("ionice"):
+        prefix += ["ionice", "-c", "3"]
+    return prefix
+
+
+def _lowprio_shell(cmd: str) -> str:
+    """همان کار، برای دستورهایی که با shell=True اجرا می‌شوند."""
+    prefix = " ".join(_lowprio_prefix())
+    return f"{prefix} {cmd}" if prefix else cmd
+
+
 def test_config_logic(outbound, dl_size_mb=0.5):
     """لاجیک اصلی تست کانفیگ (Ping + optional Download Speed)."""
     local_port = get_free_port()
@@ -376,7 +395,7 @@ def test_config_logic(outbound, dl_size_mb=0.5):
         with open(conf_file, 'w') as f:
             json.dump(full_conf, f)
 
-        proc = subprocess.Popen([XRAY_BIN, "-c", conf_file], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        proc = subprocess.Popen(_lowprio_prefix() + [XRAY_BIN, "-c", conf_file], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         if not check_port_open(local_port):
             return {"status": "Fail", "msg": "Core Start Fail", "ping": 0, "jitter": 0, "down": 0, "up": 0, "score": 0}
 
@@ -386,8 +405,10 @@ def test_config_logic(outbound, dl_size_mb=0.5):
         # Ping Test (3 tries)
         for _ in range(3):
             try:
-                cmd = f"curl -x {prox} -s -k -o /dev/null -w '%{{http_code}} %{{time_total}}' {TEST_URL} --max-time 4"
-                res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                cmd = _lowprio_shell(
+                    f"curl -x {prox} -s -k -o /dev/null -w '%{{http_code}} %{{time_total}}' {TEST_URL} --max-time 4"
+                )
+                res = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
                 if "204" in res.stdout:
                     pings.append(float(res.stdout.split()[1]) * 1000)
             except Exception:
@@ -404,8 +425,10 @@ def test_config_logic(outbound, dl_size_mb=0.5):
         if dl_size_mb and dl_size_mb > 0.5:
             try:
                 url = f"https://speed.cloudflare.com/__down?bytes={int(dl_size_mb * 1024 * 1024)}"
-                cmd = f"curl -x {prox} -s -k -w '%{{speed_download}}' -o /dev/null {url} --max-time 12"
-                res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                cmd = _lowprio_shell(
+                    f"curl -x {prox} -s -k -w '%{{speed_download}}' -o /dev/null {url} --max-time 12"
+                )
+                res = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=20)
                 dl_spd = round(float(res.stdout) / 1024 / 1024, 2)
             except Exception:
                 dl_spd = 0
@@ -517,7 +540,7 @@ AGENT_TOKEN = None  # Optional shared secret (string). If None => no auth.
 # حالا که ربات تست‌ها را موازی و روی وب‌سوکت می‌فرستد، ایجنت باید خودش
 # سقف داشته باشد؛ وگرنه ده‌ها پروسه xray + curl همزمان بالا می‌آید و
 # سرور ایران زانو می‌زند.
-AGENT_MAX_PARALLEL_TESTS = int(os.getenv("SONAR_AGENT_MAX_TESTS", "6"))
+AGENT_MAX_PARALLEL_TESTS = int(os.getenv("SONAR_AGENT_MAX_TESTS", "3"))
 _TEST_SEMAPHORE = None
 _TEST_EXECUTOR = None
 
@@ -657,8 +680,11 @@ async def start_server(port):
         "0.0.0.0",
         port,
         max_size=None,
-        ping_interval=20,
-        ping_timeout=20,
+        # 🔧 v4.3: قبلاً با ping_timeout=20 وقتی CPU نود اشباع می‌شد، ایجنت
+        # نمی‌رسید به ping جواب بدهد و websockets *همه* کانکشن‌ها را می‌بست؛
+        # بعد ربات دوباره وصل می‌شد و چرخه تکرار می‌شد.
+        ping_interval=30,
+        ping_timeout=90,
     ):
         await asyncio.Future()
 

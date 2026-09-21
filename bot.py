@@ -41,10 +41,15 @@ def main():
         print("⛔️ Error: Token not set.")
         return
 
-    print("🚀 SONAR ULTRA PRO v4.2 RUNNING...")
+    print("🚀 SONAR ULTRA PRO v4.3 RUNNING...")
     
     # 🔧 نسخه ۴.۲: pool_timeout و سقف صریح آپدیت‌های همزمان اضافه شد تا وقتی
     # چند کاربر همزمان کار سنگین می‌کنند، ارسال پیام‌ها پشت هم گیر نکند.
+    async def _post_init(application):
+        # 🩺 v4.3: ناظر تاخیر event loop — برای تشخیص اینکه هنگ از کد است یا از CPU سرور
+        import runtime
+        runtime.start_watchdog(threshold=1.0)
+
     async def _post_shutdown(application):
         try:
             from ws_client import GLOBAL_WS_POOL
@@ -66,6 +71,7 @@ def main():
         .pool_timeout(30.0)
         .connection_pool_size(256)
         .concurrent_updates(256)
+        .post_init(_post_init)
         .post_shutdown(_post_shutdown)
         .build()
     )
