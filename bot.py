@@ -41,15 +41,32 @@ def main():
         print("⛔️ Error: Token not set.")
         return
 
-    print("🚀 SONAR ULTRA PRO RUNNING...")
+    print("🚀 SONAR ULTRA PRO v4.2 RUNNING...")
     
+    # 🔧 نسخه ۴.۲: pool_timeout و سقف صریح آپدیت‌های همزمان اضافه شد تا وقتی
+    # چند کاربر همزمان کار سنگین می‌کنند، ارسال پیام‌ها پشت هم گیر نکند.
+    async def _post_shutdown(application):
+        try:
+            from ws_client import GLOBAL_WS_POOL
+            await GLOBAL_WS_POOL.close_all()
+        except Exception:
+            pass
+        try:
+            import runtime
+            runtime.shutdown()
+        except Exception:
+            pass
+
     app = (
         ApplicationBuilder()
         .token(TOKEN)
         .connect_timeout(60.0)
         .read_timeout(60.0)
         .write_timeout(60.0)
-        .concurrent_updates(True)
+        .pool_timeout(30.0)
+        .connection_pool_size(256)
+        .concurrent_updates(256)
+        .post_shutdown(_post_shutdown)
         .build()
     )
     

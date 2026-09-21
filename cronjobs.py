@@ -44,8 +44,9 @@ from cryptography.fernet import Fernet
 logger = logging.getLogger(__name__)
 db = Database()
 
-# ایجاد Executor برای کارهای سنگین دیتابیس
-EXECUTOR = ThreadPoolExecutor(max_workers=10)
+# 🔧 نسخه ۴.۲: استخر مشترک پروژه (قبلاً یک استخر ۱۰ تایی جدا بود)
+from runtime import SHARED_EXECUTOR
+EXECUTOR = SHARED_EXECUTOR
 
 SERVER_FAILURE_COUNTS = {}
 CPU_ALERT_TRACKER = {}

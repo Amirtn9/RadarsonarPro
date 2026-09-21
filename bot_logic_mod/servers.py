@@ -1013,7 +1013,7 @@ async def server_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         wait_msg = await update.callback_query.message.reply_text("⏳ **در حال آپدیت فایل مانیتورینگ روی سرور مقصد...**\n(این کار باعث نمایش دقیق آپتایم و ترافیک می‌شود)")
         
         # نصب مجدد ایجنت جدید روی سرور مقصد
-        ok, msg = await loop.run_in_executor(None, ServerMonitor.install_agent_service, srv['ip'], srv['port'], srv['username'], real_pass, AGENT_PORT)
+        ok, msg = await loop.run_in_executor(EXECUTOR, ServerMonitor.install_agent_service, srv['ip'], srv['port'], srv['username'], real_pass, AGENT_PORT)
         
         if ok:
             await wait_msg.edit_text("✅ **ایجنت با موفقیت آپدیت شد.**\nاکنون دکمه «وضعیت سرور» را بزنید تا اطلاعات دقیق نمایش داده شود.")

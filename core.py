@@ -21,6 +21,9 @@ from settings import KEY_FILE, AGENT_FILE_PATH, AGENT_PORT
 # Persistent WebSocket pool (keeps connections open + auto-reconnect)
 from ws_client import GLOBAL_WS_POOL
 
+# 🔧 نسخه ۴.۲: استخر ترد مشترک (به جای استخر پیش‌فرض ۵ تردی asyncio)
+from runtime import SHARED_EXECUTOR
+
 # Attempt to import websockets (Critical for new agent)
 try:
     import websockets
@@ -226,7 +229,28 @@ class ServerMonitor:
 
         if loop is None:
             return _runner()
-        return await loop.run_in_executor(None, _runner)
+        # 🔧 نسخه ۴.۲: قبلاً None بود (استخر پیش‌فرض ~۵ تردی) و یک کاربر
+        # می‌توانست با ۵ تست همزمان کل ربات را قفل کند.
+        return await loop.run_in_executor(SHARED_EXECUTOR, _runner)
+
+    @staticmethod
+    async def ws_test_config(ip, ws_port, token, link, size=0.5, timeout=60):
+        """تست یک کانفیگ از طریق وب‌سوکت پایدار (نسخه ۴.۲).
+
+        روش قدیمی: باز کردن یک سشن SSH جدید + اجرای `python3 monitor_agent.py`
+        به ازای هر کانفیگ. هم کند بود، هم با چند کاربر همزمان به سقف
+        MaxStartups سرور ایران می‌خورد و کل صف را می‌بست.
+
+        ایجنت از قبل اکشن `test_config` را پشتیبانی می‌کند و تست را داخل
+        خودش در یک ترد جدا اجرا می‌کند، پس وب‌سوکت آزاد می‌ماند.
+        """
+        payload = {"action": "test_config", "link": link, "size": float(size)}
+        res = await ServerMonitor.ws_send_command(ip, ws_port, token, payload, timeout=timeout)
+
+        if isinstance(res, dict) and "error" in res:
+            return False, res
+
+        return True, res
 
     @staticmethod
     async def check_full_stats_ws(ip, ws_port, password):

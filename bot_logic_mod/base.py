@@ -86,9 +86,12 @@ async def start(update, context):
 # تعداد پردازش‌های همزمان مجاز (برای جلوگیری از کرش کردن سرور)
 MAX_CONCURRENT_TASKS = 50
 
-# ✅ ThreadPoolExecutor برای کارهای sync
-EXECUTOR = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_TASKS)
-logger.debug(f"🔧 ThreadPoolExecutor initialized with {MAX_CONCURRENT_TASKS} workers")
+# 🔧 نسخه ۴.۲: به جای ساختن استخر جدید، از استخر مشترک پروژه استفاده می‌کنیم.
+# قبلاً چهار استخر مجزا وجود داشت و کارها بین‌شان پخش می‌شد؛ نتیجه این بود که
+# یک استخر کوچک (پیش‌فرض asyncio) گلوگاه کل ربات می‌شد.
+from runtime import SHARED_EXECUTOR, run_sync  # noqa: F401
+EXECUTOR = SHARED_EXECUTOR
+logger.debug("🔧 Using SHARED_EXECUTOR for sync work")
 
 # ساخت سمافور سراسری (برای صف‌بندی درخواست‌ها وقتی ظرفیت پر است)
 GLOBAL_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_TASKS)

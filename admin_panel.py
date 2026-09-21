@@ -37,8 +37,9 @@ logger = logging.getLogger(__name__)
 # 🟢 Database instance
 db = Database()
 
-# ✅ ThreadPoolExecutor برای کارهای sync
-EXECUTOR = ThreadPoolExecutor(max_workers=10)
+# 🔧 نسخه ۴.۲: استخر مشترک پروژه (قبلاً یک استخر ۱۰ تایی جدا بود)
+from runtime import SHARED_EXECUTOR
+EXECUTOR = SHARED_EXECUTOR
 
 logger.debug("📦 admin_panel.py module loaded")
 
@@ -1181,7 +1182,7 @@ async def admin_agent_port_input(update: Update, context: ContextTypes.DEFAULT_T
             def _do_install():
                 return ServerMonitor.install_agent_service(ip, ssh_port, user, password, int(ws_port))
 
-            ok, out = await loop.run_in_executor(None, _do_install)
+            ok, out = await loop.run_in_executor(EXECUTOR, _do_install)  # 🔧 v4.2
             if ok:
                 ok_count += 1
             else:

@@ -1,6 +1,7 @@
 import asyncio
 import io
 import requests
+from runtime import SHARED_EXECUTOR  # 🔧 v4.2
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes, ConversationHandler
 import keyboard
@@ -58,7 +59,7 @@ async def set_group_photo(context, group_id):
             return requests.get(PHOTO_URL, timeout=15)
 
         loop = asyncio.get_running_loop()
-        response = await loop.run_in_executor(None, _dl)
+        response = await loop.run_in_executor(SHARED_EXECUTOR, _dl)  # 🔧 v4.2
 
         if response.status_code == 200:
             bio = io.BytesIO(response.content)

@@ -55,8 +55,24 @@ class _Conn:
 
     @property
     def is_open(self) -> bool:
+        """🔧 نسخه ۴.۲ — باگ مهم نسخه ۴.۱.
+
+        قبلاً این‌طور بود:  `not getattr(self.ws, "closed", False)`
+        در websockets >= 14 آبجکت کانکشن دیگر صفت `closed` ندارد، پس
+        getattr همیشه False برمی‌گرداند و **هر سوکت مرده‌ای «باز» تشخیص
+        داده می‌شد**؛ دوباره به استخر برمی‌گشت و درخواست بعدی تا تایم‌اوت
+        روی آن منتظر می‌ماند. این یکی از دلایل «هنگ کردن» ربات بود.
+        """
+        if self.ws is None:
+            return False
         try:
-            return self.ws and not getattr(self.ws, "closed", False)
+            state = getattr(self.ws, "state", None)
+            if state is not None:
+                return str(getattr(state, "name", state)).upper() == "OPEN"
+            # سازگاری با نسخه‌های قدیمی (legacy API)
+            if hasattr(self.ws, "closed"):
+                return not bool(self.ws.closed)
+            return getattr(self.ws, "close_code", None) is None
         except Exception:
             return False
 
@@ -253,6 +269,11 @@ class WebSocketPool:
         return await self._acquire(key)
 
     def _release(self, conn: _Conn) -> None:
+        # 🔧 نسخه ۴.۲: هرگز یک کانکشن بسته را به استخر برنگردان.
+        if not conn.is_open:
+            asyncio.create_task(self._dispose(conn))
+            return
+
         q = self._queues.get(conn.key)
         if q is None:
             # pool was cleared; dispose

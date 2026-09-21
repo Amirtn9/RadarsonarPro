@@ -513,6 +513,32 @@ async def get_stats():
 
 AGENT_TOKEN = None  # Optional shared secret (string). If None => no auth.
 
+# 🔧 نسخه ۴.۲: کنترل بار روی خود ایجنت.
+# حالا که ربات تست‌ها را موازی و روی وب‌سوکت می‌فرستد، ایجنت باید خودش
+# سقف داشته باشد؛ وگرنه ده‌ها پروسه xray + curl همزمان بالا می‌آید و
+# سرور ایران زانو می‌زند.
+AGENT_MAX_PARALLEL_TESTS = int(os.getenv("SONAR_AGENT_MAX_TESTS", "6"))
+_TEST_SEMAPHORE = None
+_TEST_EXECUTOR = None
+
+
+def _get_test_semaphore():
+    global _TEST_SEMAPHORE
+    if _TEST_SEMAPHORE is None:
+        _TEST_SEMAPHORE = asyncio.Semaphore(AGENT_MAX_PARALLEL_TESTS)
+    return _TEST_SEMAPHORE
+
+
+def _get_test_executor():
+    global _TEST_EXECUTOR
+    if _TEST_EXECUTOR is None:
+        from concurrent.futures import ThreadPoolExecutor
+        _TEST_EXECUTOR = ThreadPoolExecutor(
+            max_workers=AGENT_MAX_PARALLEL_TESTS + 4,
+            thread_name_prefix="agent-test",
+        )
+    return _TEST_EXECUTOR
+
 
 async def ws_handler(websocket, path=None):
     """Handle one connected client.
@@ -559,8 +585,12 @@ Protocol:
                 outbound = parse_xray_config(link)
                 if outbound:
                     # اجرای تست در ترد جداگانه تا وب‌سوکت قفل نشود
+                    # (🔧 v4.2: executor اختصاصی + سقف همزمانی)
                     loop = asyncio.get_running_loop()
-                    res = await loop.run_in_executor(None, test_config_logic, outbound, size)
+                    async with _get_test_semaphore():
+                        res = await loop.run_in_executor(
+                            _get_test_executor(), test_config_logic, outbound, size
+                        )
                     # attach extracted name if possible
                     try:
                         res['extracted_name'] = extract_name_from_link(link) or ''
@@ -570,6 +600,31 @@ Protocol:
                 else:
                     await websocket.send(json.dumps({"status": "Fail", "msg": "Parse Error"}))
                     
+            elif action == 'fetch_sub':
+                # 🆕 نسخه ۴.۲: فقط لیست کانفیگ‌های داخل یک لینک اشتراک را برگردان.
+                # تست کردنشان کار سمت ربات است (موازی، با صف عادلانه).
+                sub_link = data.get('link')
+                loop = asyncio.get_running_loop()
+
+                def _fetch():
+                    raw = fetch_url(sub_link, timeout=25)
+                    text = normalize_subscription_text(raw)
+                    return parse_subscription_links(text)
+
+                try:
+                    configs = await loop.run_in_executor(_get_test_executor(), _fetch)
+                    await websocket.send(json.dumps({
+                        "links": configs,
+                        "sub_info": {
+                            "url": sub_link,
+                            "total": len(configs),
+                            "fetched_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                            "mode": "list",
+                        },
+                    }))
+                except Exception as e:
+                    await websocket.send(json.dumps({"error": f"fetch_sub_failed: {e}"}))
+
             elif action == 'run_cmd':
                 cmd = data.get('cmd')
                 # استفاده از تایم‌اوت ارسالی (با سقف ایمن)

@@ -1,9 +1,11 @@
-python-telegram-bot[job-queue]
-paramiko
-cryptography
+python-telegram-bot[job-queue]>=21.0,<23.0
+paramiko>=3.4
+cryptography>=42.0
 jdatetime
 matplotlib
 requests
-psycopg2-binary
-websockets
-psutil
+psycopg2-binary>=2.9
+# 🔧 نسخه ۴.۲: نسخه پین شد. در websockets >= 14 صفت `closed` حذف شده و کد
+# استخر کانکشن به همین دلیل سوکت‌های مرده را «باز» تشخیص می‌داد.
+websockets>=13.0,<16.0
+psutil>=5.9

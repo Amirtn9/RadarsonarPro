@@ -2,7 +2,7 @@ import os
 import logging
 import json
 
-PROJECT_VERSION = "4.1"
+PROJECT_VERSION = "4.2"
 
 # ==============================================================================
 # 📂 FILE PATHS CONFIGURATION
@@ -96,12 +96,14 @@ DOWN_RETRY_LIMIT = 3
 # این مقادیر به صورت پیش‌فرض، ارتباط وب‌سوکت را "همیشه زنده" نگه می‌دارند.
 # در صورت نیاز می‌توانید آن‌ها را در sonar_config.json یا Env تغییر دهید.
 
-WS_POOL_MAX_PER_KEY = int(os.getenv("SONAR_WS_POOL_MAX", "5"))
+# 🔧 نسخه ۴.۲: همه‌ی کاربرها به یک نود مانیتورینگ وصل می‌شوند، یعنی یک
+# کلید استخر مشترک. با سقف ۵، نفر ششم ۳۰ ثانیه صبر می‌کرد و خطا می‌گرفت.
+WS_POOL_MAX_PER_KEY = int(os.getenv("SONAR_WS_POOL_MAX", "20"))
 WS_OPEN_TIMEOUT = float(os.getenv("SONAR_WS_OPEN_TIMEOUT", "6"))
 WS_CLOSE_TIMEOUT = float(os.getenv("SONAR_WS_CLOSE_TIMEOUT", "6"))
 WS_PING_INTERVAL = float(os.getenv("SONAR_WS_PING_INTERVAL", "20"))
 WS_PING_TIMEOUT = float(os.getenv("SONAR_WS_PING_TIMEOUT", "20"))
-WS_ACQUIRE_TIMEOUT = float(os.getenv("SONAR_WS_ACQUIRE_TIMEOUT", "30"))
+WS_ACQUIRE_TIMEOUT = float(os.getenv("SONAR_WS_ACQUIRE_TIMEOUT", "45"))
 
 # اگر خروجی ایجنت بزرگ است (مثلاً تست ساب)، max_size=None بهترین گزینه است.
 WS_MAX_MESSAGE_SIZE = None

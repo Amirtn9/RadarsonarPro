@@ -678,21 +678,21 @@ async def test_single_config(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"⏳ لطفاً تا ۶۰ ثانیه صبر کنید..."
         )
     
-    # 4. آماده‌سازی اتصال SSH
-    ip, port, user = monitor_node['ip'], monitor_node['port'], monitor_node['username']
-    password = sec.decrypt(monitor_node['password'])
-    
-    # 5. ساخت دستور اجرا (با آرگومان 10.0 برای تست سنگین)
-    safe_link = shlex.quote(cfg['link'])
-    cmd = f"python3 -u /root/monitor_agent.py {safe_link} 10.0"
-    
+    # 4. آماده‌سازی اتصال به ایجنت (🔧 نسخه ۴.۲: وب‌سوکت به جای SSH)
+    ip = monitor_node['ip']
+    ws_port = int(monitor_node.get('ws_port') or AGENT_PORT)
+    token = sec.decrypt(monitor_node['password'])
+
     loop = asyncio.get_running_loop()
     try:
-        # ⚠️ افزایش تایم‌اوت به ۶۰ ثانیه برای تکمیل تست سنگین
-        ok, output = await ServerMonitor.run_remote_command(ip, port, user, password, cmd, 60)
-        res = extract_safe_json(output)
-        if not res:
-            res = {"status": "Error", "msg": "Invalid Output/Agent Crash"}
+        # تست سنگین ۱۰ مگابایتی روی کانکشن پایدار، با رعایت صف عادلانه
+        # تا یک کاربر نتواند کل ظرفیت نود مانیتورینگ را بگیرد.
+        async with tunnel_manager.global_sem, tunnel_manager._user_sem(update.effective_user.id):
+            ok, res = await ServerMonitor.ws_test_config(
+                ip, ws_port, token, cfg['link'], size=10.0, timeout=90
+            )
+        if not ok or not isinstance(res, dict):
+            res = {"status": "Error", "msg": "Agent unreachable / Invalid response"}
         
         # 7. تحلیل نتایج و نمایش گزارش
         if res.get("status") == "OK":
@@ -707,13 +707,15 @@ async def test_single_config(update: Update, context: ContextTypes.DEFAULT_TYPE)
             elif score >= 5: q_icon = "⚖️ معمولی"
             else: q_icon = "⚠️ ضعیف"
             
-            # آپدیت دیتابیس با مقادیر واقعی تست سنگین (استفاده از %s)
-            with db.get_connection() as (conn, cur):
-                cur.execute(
-                    "UPDATE tunnel_configs SET last_status='OK', last_ping=%s, last_jitter=%s, last_speed_up=%s, last_speed_down=%s, quality_score=%s WHERE id=%s",
-                    (ping, jitter, up, down, score, cid)
-                )
-                conn.commit()
+            # 🔧 نسخه ۴.۲: کوئری در ترد جداگانه، نه روی event loop
+            def _save_ok():
+                with db.get_connection() as (conn, cur):
+                    cur.execute(
+                        "UPDATE tunnel_configs SET last_status='OK', last_ping=%s, last_jitter=%s, last_speed_up=%s, last_speed_down=%s, quality_score=%s WHERE id=%s",
+                        (ping, jitter, up, down, score, cid)
+                    )
+                    conn.commit()
+            await run_sync(_save_ok)
             
             report = (
                 f"✅ **نتیجه تست دقیق (Heavy)** 🟢\n"
@@ -726,10 +728,12 @@ async def test_single_config(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 f"📤 **Upload:** `{up} MB/s`"
             )
         else:
-            # ثبت خطا در دیتابیس (استفاده از %s)
-            with db.get_connection() as (conn, cur):
-                cur.execute("UPDATE tunnel_configs SET last_status='Fail', quality_score=0 WHERE id=%s", (cid,))
-                conn.commit()
+            # ثبت خطا در دیتابیس (🔧 v4.2: خارج از event loop)
+            def _save_fail():
+                with db.get_connection() as (conn, cur):
+                    cur.execute("UPDATE tunnel_configs SET last_status='Fail', quality_score=0 WHERE id=%s", (cid,))
+                    conn.commit()
+            await run_sync(_save_fail)
             
             error_msg = res.get('msg', 'Timeout/Filtering')
             report = (
@@ -1372,9 +1376,15 @@ async def refresh_conf_dash_action(update: Update, context: ContextTypes.DEFAULT
     # ذخیره تسک برای مدیریت قفل کاربر
     USER_ACTIVE_TASKS[uid] = task
 async def run_quick_ping_check(context, uid, configs, monitor):
-    """لاجیک تست بسیار سریع و سبک (فقط پینگ) - بهینه شده و غیر مسدود کننده"""
-    ip, port, user = monitor['ip'], monitor['port'], monitor['username']
-    password = sec.decrypt(monitor['password'])
+    """لاجیک تست بسیار سریع و سبک (فقط پینگ).
+
+    🔧 نسخه ۴.۲: به جای باز کردن یک سشن SSH جدید به ازای هر کانفیگ، تست‌ها
+    روی کانکشن وب‌سوکت پایدارِ ایجنت اجرا می‌شوند و صف عادلانه‌ی
+    tunnel_manager رعایت می‌شود (سقف سراسری + سقف هر کاربر).
+    """
+    ip = monitor['ip']
+    ws_port = int(monitor.get('ws_port') or AGENT_PORT)
+    token = sec.decrypt(monitor['password'])
     loop = asyncio.get_running_loop()
 
     # پردازش دسته‌ای (۱۰ تایی برای سرعت بیشتر)
@@ -1405,25 +1415,25 @@ async def run_quick_ping_check(context, uid, configs, monitor):
                     cur.execute("UPDATE tunnel_configs SET last_status='Fail' WHERE id=%s", (cid,))
             conn.commit()
 
+    async def _probe(cfg):
+        """یک تست سبک روی وب‌سوکت، با رعایت صف عادلانه."""
+        async with tunnel_manager.global_sem, tunnel_manager._user_sem(uid):
+            try:
+                ok, data = await ServerMonitor.ws_test_config(
+                    ip, ws_port, token, cfg['link'], size=0.2, timeout=20
+                )
+            except Exception as e:
+                logger.warning("quick ping failed for %s: %s", cfg.get('id'), e)
+                return False, ""
+            if ok and isinstance(data, dict):
+                return True, json.dumps(data)
+            return False, ""
+
     for i in range(0, len(configs), chunk_size):
         chunk = configs[i:i+chunk_size]
-        tasks = []
-        
-        for cfg in chunk:
-            link_arg = cfg['link']
-            if cfg['type'] == 'json' or link_arg.strip().startswith('{'):
-                safe_link = link_arg.replace('"', '\\"')
-                cmd = f'python3 /root/monitor_agent.py "{safe_link}" 0.2'
-            else:
-                cmd = f"python3 /root/monitor_agent.py '{link_arg}' 0.2"
-            
-            # تایم اوت کوتاه (۸ ثانیه) برای عدم معطلی
-            # FIX: ServerMonitor.run_remote_command is async; do not call it in executor
-            tasks.append(ServerMonitor.run_remote_command(ip, port, user, password, cmd, 8))
-        
-        results = await asyncio.gather(*tasks)
-        
-        # 🚀 آپدیت دیتابیس در بک‌گراند (بدون قفل کردن ربات)
+        results = await asyncio.gather(*[_probe(cfg) for cfg in chunk])
+
+        # 🚀 آپدیت دیتابیس در ترد جداگانه (بدون قفل کردن event loop)
         await loop.run_in_executor(EXECUTOR, db_batch_update, results, chunk)
 # ==============================================================================
 # 🧩 MISSING FUNCTIONS (توابع گم‌شده)
