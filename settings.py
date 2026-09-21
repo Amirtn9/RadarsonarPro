@@ -1,13 +1,18 @@
 import os
 import logging
+import json
+
+PROJECT_VERSION = "4.1"
 
 # ==============================================================================
-# 📂 FILE PATHS CONFIGURATION (بخش گم‌شده)
+# 📂 FILE PATHS CONFIGURATION
 # ==============================================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # نام فایل‌های حیاتی
-DB_NAME = "sonar_ultra_pro.db"  # جهت سازگاری با کدهای قدیمی
+# NOTE: پروژه از PostgreSQL استفاده می‌کند. DB_NAME صرفاً برای سازگاری با بخش‌هایی
+# مثل بکاپ‌گیری (خروجی pg_dump) نگه داشته شده است.
+DB_NAME = "sonar_ultra_pro.db"
 CONFIG_FILE = "sonar_config.json"
 KEY_FILE = "secret.key"
 AGENT_FILE_PATH = os.path.join(BASE_DIR, "monitor_agent.py")
@@ -24,9 +29,19 @@ DB_CONFIG = {
 }
 
 # ==============================================================================
-# 👤 ADMIN CONFIGURATION
+# 👤 ADMIN & PORT CONFIGURATION (Dynamic)
 # ==============================================================================
-SUPER_ADMIN_ID = 585214295
+SUPER_ADMIN_ID = 0
+AGENT_PORT = 8181  # پورت پیش‌فرض
+
+try:
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE, 'r') as f:
+            data = json.load(f)
+            SUPER_ADMIN_ID = int(data.get('admin_id', 0))
+            AGENT_PORT = int(data.get('agent_port', 8080)) # خواندن پورت از فایل
+except Exception as e:
+    print(f"Error loading settings: {e}")
 
 # ==============================================================================
 # 💳 SUBSCRIPTION PLANS
@@ -72,8 +87,35 @@ PAYMENT_INFO = {
 # ==============================================================================
 # 📟 MONITORING CONFIG
 # ==============================================================================
-DEFAULT_INTERVAL = 120   # بازه زمانی چک کردن تسک‌ها (ثانیه)
-DOWN_RETRY_LIMIT = 3     # تعداد تلاش قبل از اعلام قطعی سرور
+DEFAULT_INTERVAL = 120
+DOWN_RETRY_LIMIT = 3
+
+# ============================================================================== 
+# 🔌 WEBSOCKET (AGENT) STABILITY SETTINGS
+# ============================================================================== 
+# این مقادیر به صورت پیش‌فرض، ارتباط وب‌سوکت را "همیشه زنده" نگه می‌دارند.
+# در صورت نیاز می‌توانید آن‌ها را در sonar_config.json یا Env تغییر دهید.
+
+WS_POOL_MAX_PER_KEY = int(os.getenv("SONAR_WS_POOL_MAX", "5"))
+WS_OPEN_TIMEOUT = float(os.getenv("SONAR_WS_OPEN_TIMEOUT", "6"))
+WS_CLOSE_TIMEOUT = float(os.getenv("SONAR_WS_CLOSE_TIMEOUT", "6"))
+WS_PING_INTERVAL = float(os.getenv("SONAR_WS_PING_INTERVAL", "20"))
+WS_PING_TIMEOUT = float(os.getenv("SONAR_WS_PING_TIMEOUT", "20"))
+WS_ACQUIRE_TIMEOUT = float(os.getenv("SONAR_WS_ACQUIRE_TIMEOUT", "30"))
+
+# اگر خروجی ایجنت بزرگ است (مثلاً تست ساب)، max_size=None بهترین گزینه است.
+WS_MAX_MESSAGE_SIZE = None
+
+try:
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE, 'r') as f:
+            _data = json.load(f)
+            WS_POOL_MAX_PER_KEY = int(_data.get('ws_pool_max', WS_POOL_MAX_PER_KEY))
+            WS_PING_INTERVAL = float(_data.get('ws_ping_interval', WS_PING_INTERVAL))
+            WS_PING_TIMEOUT = float(_data.get('ws_ping_timeout', WS_PING_TIMEOUT))
+except Exception:
+    # اگر فایل کانفیگ خراب بود یا نبود، با مقادیر پیش‌فرض ادامه می‌دهیم.
+    pass
 
 # ==============================================================================
 # 📝 LOGGING CONFIG

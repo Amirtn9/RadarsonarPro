@@ -10,592 +10,703 @@ import zipfile
 import re
 import random
 import socket
-import logging
 import math
 import shlex
-from datetime import datetime
 import argparse
-import signal
+import asyncio
+from datetime import datetime, timedelta
+import logging
+
+logger = logging.getLogger('ws_client')  # ✅ خودکار به سیستم متصل می‌شه
+
+# ✅ جمع‌آوری لاگ‌های WS (بدون ارجاع به متغیرهای تعریف‌نشده در سطح ماژول)
+try:
+    logger.debug("WS module initialized (ip=%s, port=%s)", locals().get('ip'), locals().get('port'))
+except Exception:
+    pass
+try:
+    logger.debug("WebSocket error hook ready")
+except Exception:
+    pass
+# تلاش برای ایمپورت کتابخانه‌های وب‌سوکت (اگر نصب نباشند، در حالت CLI ارور ندهد)
+try:
+    import websockets
+    import psutil
+except ImportError:
+    websockets = None
+    psutil = None
 
 # ==============================================================================
-# ⚙️ SYSTEM CONFIGURATION & LOGGING
+# ⚙️ SYSTEM CONFIGURATION
 # ==============================================================================
 USER_HOME = os.path.expanduser("~")
 WORK_DIR = os.path.join(USER_HOME, "xray_workspace")
 XRAY_BIN = os.path.join(WORK_DIR, "xray")
 LOG_FILE = os.path.join(USER_HOME, "agent_debug.log")
-
-TEST_URL = "http://www.google.com/generate_204"
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+TEST_URL = "http://www.google.com/generate_204"
 
 if not os.path.exists(WORK_DIR):
     try: os.makedirs(WORK_DIR, mode=0o755)
     except: pass
 
 def advanced_log(message, category="INFO"):
-    """ثبت لاگ دقیق در فایل برای دیباگ"""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    log_entry = f"[{timestamp}] [{category}] {message}\n"
+    entry = f"[{timestamp}] [{category}] {message}\n"
     try:
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(log_entry)
+        with open(LOG_FILE, "a", encoding="utf-8") as f: f.write(entry)
     except: pass
 
 # ==============================================================================
-# ⏰ ROBUST TIME SYNCHRONIZATION
-# ==============================================================================
-def sync_system_time():
-    """همگام‌سازی زمان از منابع مختلف (جلوگیری از خطای Time Sync در VMess)"""
-    sources = [
-        "https://www.google.com",
-        "https://www.cloudflare.com",
-        "https://www.microsoft.com"
-    ]
-    
-    for url in sources:
-        try:
-            cmd = f"date -s \"$(curl -sI --connect-timeout 3 {url} | grep -i '^date:' | sed 's/^[Dd]ate: //g')\""
-            res = subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            if res.returncode == 0:
-                advanced_log(f"Time synced via {url}", "SYSTEM")
-                return
-        except: continue
-    advanced_log("Time sync failed on all sources.", "WARN")
-
-# ==============================================================================
-# 🛠 NETWORK UTILITIES
+# 🛠 UTILITIES (Common)
 # ==============================================================================
 def get_free_port():
-    """یافتن پورت خالی تصادفی"""
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(('', 0))
-            return s.getsockname()[1]
+            s.bind(('', 0)); return s.getsockname()[1]
     except: return random.randint(20000, 40000)
 
 def check_port_open(port, timeout=5):
-    """بررسی باز شدن پورت محلی"""
-    start_time = time.time()
-    while time.time() - start_time < timeout:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.settimeout(0.5)
-            if sock.connect_ex(('127.0.0.1', port)) == 0: return True
+    start = time.time()
+    while time.time() - start < timeout:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.5)
+            if s.connect_ex(('127.0.0.1', port)) == 0: return True
         time.sleep(0.2)
     return False
 
+def decode_base64(data):
+    try:
+        data = data.strip().replace('\n', '').replace(' ', '')
+        missing = len(data) % 4
+        if missing: data += '=' * (4 - missing)
+        return base64.b64decode(data.replace('-', '+').replace('_', '/')).decode('utf-8', errors='ignore')
+    except: return data
+
+
 # ==============================================================================
-# 📦 INSTALLATION MANAGER
+# 🔗 SUBSCRIPTION FETCH & PARSE (CLI MODE SUPPORT)
+# ==============================================================================
+def fetch_url(url, timeout=20):
+    """Download subscription content (bytes)."""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "*/*"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read()
+    except Exception as e:
+        advanced_log(f"Subscription fetch failed: {e}", "SUB")
+        return b""
+
+def normalize_subscription_text(raw_bytes):
+    """Return a readable text for v2ray/xray subscriptions (base64 or plain)."""
+    try:
+        raw_text = raw_bytes.decode("utf-8", errors="ignore").strip()
+        if not raw_text:
+            return ""
+        # Many subs are base64 of multiple lines
+        decoded = decode_base64(raw_text)
+        if any(proto in decoded for proto in ("vmess://", "vless://", "trojan://", "ss://")):
+            return decoded
+        return raw_text
+    except Exception:
+        return ""
+
+def extract_name_from_link(link):
+    """Best-effort name extraction from different link formats."""
+    try:
+        link = (link or "").strip()
+        if link.startswith("vmess://"):
+            c = json.loads(decode_base64(link[8:]))
+            return (c.get("ps") or c.get("remark") or c.get("name") or "").strip()
+        # For URL based links, name usually is in fragment (#...)
+        p = urllib.parse.urlparse(link)
+        if p.fragment:
+            return urllib.parse.unquote(p.fragment).replace("+", " ").strip()
+        return ""
+    except Exception:
+        return ""
+
+def parse_subscription_links(text_data, limit=0):
+    """Parse subscription text and return list of {'name','link'}."""
+    results = []
+    if not text_data:
+        return results
+    lines = [ln.strip() for ln in text_data.replace("\r", "\n").split("\n") if ln.strip()]
+    for ln in lines:
+        if not (ln.startswith(("vmess://", "vless://", "trojan://", "ss://")) or ln.startswith("{")):
+            continue
+        name = extract_name_from_link(ln) or f"Item_{len(results)+1}"
+        results.append({"name": name, "link": ln})
+        if limit and len(results) >= limit:
+            break
+    return results
+
+# ==============================================================================
+# 📦 XRAY MANAGER
 # ==============================================================================
 def install_xray():
-    """نصب یا بررسی هسته Xray"""
-    if os.path.exists(XRAY_BIN) and os.access(XRAY_BIN, os.X_OK):
-        # بررسی سلامت فایل
-        try:
-            subprocess.check_output([XRAY_BIN, "-version"], stderr=subprocess.STDOUT)
-            return
-        except:
-            advanced_log("Xray binary corrupted, reinstalling...", "WARN")
-            os.remove(XRAY_BIN)
-
-    advanced_log("Installing Xray Core...", "INSTALL")
-    zip_path = os.path.join(WORK_DIR, "xray.zip")
+    if os.path.exists(XRAY_BIN) and os.access(XRAY_BIN, os.X_OK): return
     
-    # لیست میرورها برای عبور از فیلترینگ گیت‌هاب
+    advanced_log("Installing Xray...", "INSTALL")
+    zip_path = os.path.join(WORK_DIR, "xray.zip")
     urls = [
         "https://mirror.ghproxy.com/https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip",
         "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip"
     ]
-
-    downloaded = False
+    
     for url in urls:
-        if downloaded: break
         try:
-            advanced_log(f"Downloading from: {url}", "DOWNLOAD")
-            # استفاده از curl با retry و timeout
-            subprocess.call(f"curl -L -k -o {zip_path} {url} --connect-timeout 15 --max-time 300 --retry 2", shell=True)
-            
-            if os.path.exists(zip_path) and os.path.getsize(zip_path) > 2 * 1024 * 1024:
-                try:
-                    with zipfile.ZipFile(zip_path, 'r') as z:
-                        if 'xray' in z.namelist(): downloaded = True
-                except: pass
-        except Exception as e:
-            advanced_log(f"Download failed: {e}", "ERROR")
-
-    if not downloaded:
-        advanced_log("CRITICAL: Failed to download Xray.", "FATAL")
-        sys.exit(1)
-
-    try:
-        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            zip_ref.extractall(WORK_DIR)
-        os.remove(zip_path)
-        os.chmod(XRAY_BIN, 0o755)
-        advanced_log("Xray installed successfully.", "INSTALL")
-    except Exception as e:
-        advanced_log(f"Install Error: {e}", "ERROR")
-        sys.exit(1)
+            subprocess.call(f"curl -L -k -o {zip_path} {url} --connect-timeout 15 --retry 2", shell=True)
+            if os.path.exists(zip_path) and os.path.getsize(zip_path) > 1024*1024:
+                with zipfile.ZipFile(zip_path, 'r') as z: z.extractall(WORK_DIR)
+                os.chmod(XRAY_BIN, 0o755)
+                os.remove(zip_path)
+                return
+        except: pass
 
 # ==============================================================================
-# 🧩 PARSING LOGIC (HIGH LOGIC)
+# 🧩 PARSING & TESTING LOGIC
 # ==============================================================================
-def decode_base64(data):
-    """دیکد هوشمند بیس۶۴ با اصلاح پدینگ"""
-    try:
-        data = data.strip().replace('\n', '').replace('\r', '').replace(' ', '')
-        missing_padding = len(data) % 4
-        if missing_padding: data += '=' * (4 - missing_padding)
-        data = data.replace('-', '+').replace('_', '/')
-        return base64.b64decode(data).decode('utf-8', errors='ignore')
-    except: return data
 
 def parse_xray_config(link):
-    """تبدیل لینک‌های مختلف به ساختار استاندارد Xray Outbound"""
+    """Parse common v2ray/xray share links into a minimal Xray outbound."""
     try:
-        link = link.strip()
-        if not link: return None
+        link = (link or "").strip()
+        if not link:
+            return None
 
-        # تمیزکاری کوتیشن
-        if link.startswith('"') and link.endswith('"'): link = link[1:-1]
-        if link.startswith("'") and link.endswith("'"): link = link[1:-1]
-
-        # 1. پردازش JSON مستقیم
+        # JSON outbound (already)
         if link.startswith('{'):
-            try:
-                conf = json.loads(link)
-                if 'outbounds' in conf: return conf['outbounds'][0]
-                if 'settings' in conf and 'protocol' in conf: return conf 
-                return None
-            except: return None
+            return json.loads(link)
 
-        # 2. پردازش VMess
+        # ----------------------------
+        # VMESS
+        # ----------------------------
         if link.startswith('vmess://'):
-            try:
-                b64 = link[8:]
-                c = json.loads(decode_base64(b64))
-                
-                stream = {
-                    "network": c.get('net', 'tcp'),
-                    "security": c.get('tls', 'none')
+            c = json.loads(decode_base64(link[8:]))
+            net = c.get('net', 'tcp')
+            tls = c.get('tls', 'none')
+            stream = {"network": net, "security": tls or "none"}
+
+            if net == 'ws':
+                stream["wsSettings"] = {
+                    "path": c.get('path', '/') or '/',
+                    "headers": {"Host": c.get('host', '') or ""}
                 }
-                
-                # تنظیمات Transport
-                if c.get('net') == 'ws':
-                    stream["wsSettings"] = {
-                        "path": c.get('path', '/'),
-                        "headers": {"Host": c.get('host', '')}
-                    }
-                elif c.get('net') == 'grpc':
-                    stream["grpcSettings"] = {"serviceName": c.get('path', '')}
-                elif c.get('net') == 'tcp' and c.get('type') == 'http':
-                    stream["tcpSettings"] = {
-                        "header": {
-                            "type": "http",
-                            "request": {"headers": {"Host": [c.get('host', '')]}, "path": [c.get('path', '/')]}
-                        }
-                    }
+            elif net == 'grpc':
+                stream["grpcSettings"] = {"serviceName": c.get('path', '') or ""}
 
-                # تنظیمات TLS
-                if c.get('tls') == 'tls':
-                    stream["tlsSettings"] = {
-                        "serverName": c.get('sni') or c.get('host'),
-                        "allowInsecure": True,
-                        "fingerprint": c.get('fp', 'chrome')
-                    }
+            if tls == 'tls':
+                stream["tlsSettings"] = {
+                    "serverName": (c.get('sni') or c.get('host') or c.get('add') or ""),
+                    "allowInsecure": True
+                }
 
-                return {
-                    "protocol": "vmess",
-                    "settings": {
-                        "vnext": [{
-                            "address": c.get('add'),
-                            "port": int(c.get('port')),
-                            "users": [{"id": c.get('id'), "alterId": int(c.get('aid', 0)), "security": "auto"}]
+            return {
+                "protocol": "vmess",
+                "settings": {
+                    "vnext": [{
+                        "address": c.get('add'),
+                        "port": int(c.get('port') or 443),
+                        "users": [{
+                            "id": c.get('id'),
+                            "alterId": 0,
+                            "security": c.get('scy', 'auto') or "auto"
                         }]
-                    },
-                    "streamSettings": stream,
-                    "tag": "proxy"
+                    }]
+                },
+                "streamSettings": stream,
+                "tag": "proxy"
+            }
+
+        # ----------------------------
+        # VLESS
+        # ----------------------------
+        if link.startswith('vless://'):
+            p = urllib.parse.urlparse(link)
+            q = urllib.parse.parse_qs(p.query)
+
+            net = q.get('type', ['tcp'])[0]
+            sec = q.get('security', ['none'])[0]
+            stream = {"network": net, "security": sec or "none"}
+
+            if net == 'ws':
+                stream['wsSettings'] = {
+                    "path": q.get('path', ['/'])[0] or '/',
+                    "headers": {"Host": q.get('host', [''])[0] or ""}
                 }
-            except: return None
+            elif net == 'grpc':
+                stream['grpcSettings'] = {"serviceName": q.get('serviceName', [''])[0] or ""}
 
-        # 3. پردازش VLESS / Trojan
-        if link.startswith(('vless://', 'trojan://')):
-            try:
-                parsed = urllib.parse.urlparse(link)
-                q = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
-                protocol = 'vless' if link.startswith('vless') else 'trojan'
-                
-                # استخراج پارامترها با دیکد کردن URL Encoding
-                def get_param(key, default=''):
-                    val = q.get(key, [default])[0]
-                    return urllib.parse.unquote(val)
-
-                stream = {
-                    "network": get_param('type', 'tcp'),
-                    "security": get_param('security', 'none')
+            if sec == 'tls':
+                stream['tlsSettings'] = {
+                    "serverName": q.get('sni', [p.hostname or ""])[0] or (p.hostname or ""),
+                    "allowInsecure": True
+                }
+            elif sec == 'reality':
+                stream['realitySettings'] = {
+                    "publicKey": q.get('pbk', [''])[0] or "",
+                    "serverName": q.get('sni', [p.hostname or ""])[0] or (p.hostname or ""),
+                    "fingerprint": q.get('fp', ['chrome'])[0] or "chrome"
                 }
 
-                if stream['network'] == 'ws':
-                    stream["wsSettings"] = {"path": get_param('path', '/'), "headers": {"Host": get_param('host')}}
-                elif stream['network'] == 'grpc':
-                    stream["grpcSettings"] = {"serviceName": get_param('serviceName')}
-                elif stream['network'] == 'tcp' and get_param('headerType') == 'http':
-                     stream["tcpSettings"] = {
-                        "header": {
-                            "type": "http",
-                            "request": {"headers": {"Host": [get_param('host')]}, "path": [get_param('path', '/')]}
-                        }
-                    }
-
-                sni = get_param('sni', parsed.hostname)
-                if stream['security'] == 'tls':
-                     stream["tlsSettings"] = {
-                         "serverName": sni, "allowInsecure": True, "fingerprint": get_param('fp', 'chrome')
-                     }
-                     if get_param('alpn'): stream["tlsSettings"]['alpn'] = get_param('alpn').split(',')
-                elif stream['security'] == 'reality':
-                     stream["realitySettings"] = {
-                         "publicKey": get_param('pbk'), "shortId": get_param('sid'), "serverName": sni, 
-                         "fingerprint": get_param('fp', 'chrome'), "spiderX": get_param('spx', '/')
-                     }
-
-                return {
-                    "protocol": protocol,
-                    "settings": {
-                        "vnext": [{
-                            "address": parsed.hostname,
-                            "port": parsed.port,
-                            "users": [{
-                                "id": parsed.username,
-                                "password": parsed.username,
-                                "encryption": "none",
-                                "flow": get_param('flow')
-                            }]
+            return {
+                "protocol": "vless",
+                "settings": {
+                    "vnext": [{
+                        "address": p.hostname,
+                        "port": int(p.port or 443),
+                        "users": [{
+                            "id": p.username,
+                            "encryption": "none",
+                            "flow": q.get('flow', [''])[0] or ""
                         }]
-                    },
-                    "streamSettings": stream,
-                    "tag": "proxy"
-                }
-            except: return None
+                    }]
+                },
+                "streamSettings": stream,
+                "tag": "proxy"
+            }
 
-        # 4. پردازش Shadowsocks (SS)
+        # ----------------------------
+        # TROJAN
+        # ----------------------------
+        if link.startswith('trojan://'):
+            p = urllib.parse.urlparse(link)
+            q = urllib.parse.parse_qs(p.query)
+
+            password = p.username or p.password or ""
+            net = q.get('type', ['tcp'])[0]
+            sec = q.get('security', ['tls'])[0]  # trojan commonly uses tls
+            stream = {"network": net, "security": sec or "tls"}
+
+            if net == 'ws':
+                stream['wsSettings'] = {
+                    "path": q.get('path', ['/'])[0] or '/',
+                    "headers": {"Host": q.get('host', [''])[0] or ""}
+                }
+            elif net == 'grpc':
+                stream['grpcSettings'] = {"serviceName": q.get('serviceName', [''])[0] or ""}
+
+            if sec == 'tls':
+                stream['tlsSettings'] = {
+                    "serverName": q.get('sni', [p.hostname or ""])[0] or (p.hostname or ""),
+                    "allowInsecure": True
+                }
+
+            return {
+                "protocol": "trojan",
+                "settings": {
+                    "servers": [{
+                        "address": p.hostname,
+                        "port": int(p.port or 443),
+                        "password": password
+                    }]
+                },
+                "streamSettings": stream,
+                "tag": "proxy"
+            }
+
+        # ----------------------------
+        # SHADOWSOCKS (basic)
+        # ----------------------------
         if link.startswith('ss://'):
-            try:
-                body = link[5:]
-                if '#' in body: body = body.split('#')[0]
-                
-                # تشخیص فرمت (SIP002 vs Legacy)
-                if '@' in body:
-                    # New Format: user:pass@host:port
-                    user_info_b64, host_port = body.split('@', 1)
-                    host, port = host_port.split(':')
-                    user_info = decode_base64(user_info_b64)
-                else:
-                    # Legacy Format: All Base64
-                    decoded = decode_base64(body)
-                    if '@' in decoded:
-                        user_info, host_port = decoded.split('@', 1)
-                        host, port = host_port.split(':')
-                    else: return None
+            body = link[5:]
+            # strip fragment
+            body, _, frag = body.partition('#')
+            # strip query
+            body, _, _q = body.partition('?')
 
-                method, password = user_info.split(':', 1)
-                
-                return {
-                    "protocol": "shadowsocks",
-                    "settings": {
-                        "servers": [{
-                            "address": host,
-                            "port": int(port),
-                            "method": method,
-                            "password": password,
-                            "ota": False
-                        }]
-                    },
-                    "tag": "proxy"
-                }
-            except: return None
+            method = password = host = None
+            port = None
+
+            if '@' in body:
+                userinfo, _, hostport = body.rpartition('@')
+                if ':' in userinfo:
+                    method, password = userinfo.split(':', 1)
+                    method = urllib.parse.unquote(method)
+                    password = urllib.parse.unquote(password)
+                else:
+                    dec = decode_base64(userinfo)
+                    if ':' in dec:
+                        method, password = dec.split(':', 1)
+                if ':' in hostport:
+                    host, port = hostport.split(':', 1)
+            else:
+                dec = decode_base64(body)
+                if '@' in dec:
+                    userinfo, hostport = dec.rsplit('@', 1)
+                    if ':' in userinfo:
+                        method, password = userinfo.split(':', 1)
+                    if ':' in hostport:
+                        host, port = hostport.split(':', 1)
+
+            if not (method and password and host and port):
+                return None
+
+            return {
+                "protocol": "shadowsocks",
+                "settings": {
+                    "servers": [{
+                        "address": host,
+                        "port": int(port),
+                        "method": method,
+                        "password": password
+                    }]
+                },
+                "tag": "proxy"
+            }
 
         return None
     except Exception as e:
-        advanced_log(f"Parse Config Error: {e}", "ERROR")
+        advanced_log(f"parse_xray_config error: {e}", "PARSE")
         return None
-
-# ==============================================================================
-# 🚀 CORE TESTING LOGIC
-# ==============================================================================
-def test_config(outbound, dl_size_mb, config_name="Config"):
-    """اجرای تست اتصال با Xray Core"""
-    advanced_log(f"Testing: {config_name}", "TEST")
-    
+def test_config_logic(outbound, dl_size_mb=0.5):
+    """لاجیک اصلی تست کانفیگ (Ping + optional Download Speed)."""
     local_port = get_free_port()
-    config_file = os.path.join(WORK_DIR, f"config_{local_port}.json")
-    
-    # کانفیگ اجرایی Xray
-    full_config = {
-        "log": {"loglevel": "error"},
+    conf_file = os.path.join(WORK_DIR, f"config_{local_port}.json")
+    full_conf = {
+        "log": {"loglevel": "none"},
         "inbounds": [{"port": local_port, "listen": "127.0.0.1", "protocol": "socks", "settings": {"udp": True}}],
         "outbounds": [outbound, {"protocol": "freedom", "tag": "direct"}],
-        "routing": {
-            "domainStrategy": "IPOnDemand",
-            "rules": [{"type": "field", "ip": ["geoip:private", "geoip:ir"], "outboundTag": "direct"}]
-        }
+        "routing": {"domainStrategy": "IPOnDemand", "rules": [{"type": "field", "ip": ["geoip:private", "geoip:ir"], "outboundTag": "direct"}]}
     }
-    
+
     proc = None
     try:
-        with open(config_file, 'w') as f:
-            json.dump(full_config, f, indent=2)
-            
-        proc = subprocess.Popen([XRAY_BIN, "-c", config_file], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        
-        # انتظار برای باز شدن پورت
-        if not check_port_open(local_port, timeout=2):
-            return {"status": "Fail", "msg": "❌ Core Start Fail", "score": 0}
-            
+        with open(conf_file, 'w') as f:
+            json.dump(full_conf, f)
+
+        proc = subprocess.Popen([XRAY_BIN, "-c", conf_file], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        if not check_port_open(local_port):
+            return {"status": "Fail", "msg": "Core Start Fail", "ping": 0, "jitter": 0, "down": 0, "up": 0, "score": 0}
+
         prox = f"socks5://127.0.0.1:{local_port}"
-        is_fast_mode = dl_size_mb < 0.3
-        total_probes = 2 if is_fast_mode else 5
-        conn_timeout = "2" if is_fast_mode else "4"
-        
         pings = []
-        success_count = 0
-        
-        # 1. PING TEST
-        for _ in range(total_probes):
+
+        # Ping Test (3 tries)
+        for _ in range(3):
             try:
-                curl_args = [
-                    "curl", "-x", prox, "-s", "-k", "-A", USER_AGENT,
-                    "-o", "/dev/null", "-w", "%{http_code} %{time_total}",
-                    TEST_URL, "--connect-timeout", conn_timeout, "--max-time", "5"
-                ]
-                res = subprocess.run(curl_args, capture_output=True, text=True)
-                parts = res.stdout.split()
-                if len(parts) >= 2 and (parts[0] == "204" or parts[0] == "200"):
-                    pings.append(float(parts[1]) * 1000)
-                    success_count += 1
-            except: pass
-            time.sleep(0.1 if is_fast_mode else 0.2)
-            
-        if success_count == 0:
-            return {"status": "Fail", "msg": "🚫 Timeout/Filter", "score": 0}
+                cmd = f"curl -x {prox} -s -k -o /dev/null -w '%{{http_code}} %{{time_total}}' {TEST_URL} --max-time 4"
+                res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                if "204" in res.stdout:
+                    pings.append(float(res.stdout.split()[1]) * 1000)
+            except Exception:
+                pass
+
+        if not pings:
+            return {"status": "Fail", "msg": "Timeout", "ping": 0, "jitter": 0, "down": 0, "up": 0, "score": 0}
 
         avg_ping = int(sum(pings) / len(pings))
-        jitter = int(math.sqrt(sum([(x - avg_ping) ** 2 for x in pings]) / len(pings))) if len(pings) > 1 else 0
+        jitter = int(max(pings) - min(pings)) if len(pings) >= 2 else 0
 
-        # 2. SPEED TEST (Optional)
-        dl_speed, ul_speed = 0.0, 0.0
-        if dl_size_mb > 0.5:
-            bytes_dl = int(dl_size_mb * 1024 * 1024)
-            url_dl = f"https://speed.cloudflare.com/__down?bytes={bytes_dl}"
-            cmd_dl = [
-                "curl", "-L", "-k", "-x", prox, "-A", USER_AGENT, "-s",
-                "-w", "%{speed_download}", "-o", "/dev/null", url_dl,
-                "--connect-timeout", "5", "--max-time", "30"
-            ]
-            res_dl = subprocess.run(cmd_dl, capture_output=True, text=True)
-            try: dl_speed = round(float(res_dl.stdout) / 1024 / 1024, 2)
-            except: pass
+        # Download Speed Test (Optional)
+        dl_spd = 0
+        if dl_size_mb and dl_size_mb > 0.5:
+            try:
+                url = f"https://speed.cloudflare.com/__down?bytes={int(dl_size_mb * 1024 * 1024)}"
+                cmd = f"curl -x {prox} -s -k -w '%{{speed_download}}' -o /dev/null {url} --max-time 12"
+                res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                dl_spd = round(float(res.stdout) / 1024 / 1024, 2)
+            except Exception:
+                dl_spd = 0
 
-            if dl_size_mb > 2.0:
-                url_ul = "https://speed.cloudflare.com/__up"
-                safe_prox = shlex.quote(prox)
-                cmd_ul = f"dd if=/dev/zero bs=1000 count=1000 2>/dev/null | curl -L -k -x {safe_prox} -s -w '%{{speed_upload}}' -o /dev/null --upload-file - {url_ul} --connect-timeout 5 --max-time 20"
-                res_ul = subprocess.run(cmd_ul, shell=True, capture_output=True, text=True)
-                try: ul_speed = round(float(res_ul.stdout) / 1024 / 1024, 2)
-                except: pass
+        # Simple score
+        score = 10
+        if avg_ping > 1200:
+            score = 1
+        elif avg_ping > 800:
+            score = 3
+        elif avg_ping > 500:
+            score = 5
+        elif avg_ping > 300:
+            score = 7
+        elif avg_ping > 150:
+            score = 9
 
-        # 3. SCORING
-        score = 10.0
-        if avg_ping > 800: score -= 4
-        elif avg_ping > 400: score -= 2
-        
-        if jitter > 200: score -= 2
-        elif jitter > 50: score -= 1
-        
-        if dl_size_mb > 0.5:
-            if dl_speed < 0.5: score -= 3
-            elif dl_speed < 2.0: score -= 1
-            
-        score = round(max(0.0, min(10.0, score)), 1)
-        
-        status_msg = "✅ Connected"
-        if score >= 8: status_msg = "🚀 Excellent"
-        elif score >= 5: status_msg = "⚖️ Normal"
-        elif score < 5: status_msg = "⚠️ Weak"
-
-        advanced_log(f"Result: {status_msg} | Ping: {avg_ping} | Score: {score}", "RESULT")
-
-        return {
-            "status": "OK", "ping": avg_ping, "jitter": jitter,
-            "down": dl_speed, "up": ul_speed, "score": score,
-            "protocol": outbound.get('protocol', 'unknown').upper(),
-            "msg": status_msg
-        }
+        return {"status": "OK", "ping": avg_ping, "jitter": jitter, "down": dl_spd, "up": 0, "score": score}
 
     except Exception as e:
-        advanced_log(f"Test Exception: {e}", "ERROR")
-        return {"status": "Fail", "msg": f"❌ Error: {str(e)[:20]}", "score": 0}
+        return {"status": "Fail", "msg": str(e), "ping": 0, "jitter": 0, "down": 0, "up": 0, "score": 0}
+
     finally:
-        # پاکسازی پروسه و فایل
-        if proc:
-            try: proc.terminate(); proc.wait(timeout=1)
-            except: proc.kill()
-        if os.path.exists(config_file):
-            try: os.remove(config_file)
-            except: pass
-
-# ==============================================================================
-# 🏁 MAIN ENTRY POINT (SMART PARSING)
-# ==============================================================================
-if __name__ == "__main__":
-    sys.stdout.reconfigure(encoding='utf-8')
-    parser = argparse.ArgumentParser()
-    parser.add_argument("link", help="Config Link")
-    parser.add_argument("size", nargs="?", default="0.5", help="DL Size MB")
-    args = parser.parse_args()
-
-    advanced_log(f"Received Request: {args.link[:50]}...", "REQ")
-
-    # 1. تنظیمات اولیه
-    sync_system_time()
-    install_xray()
-    
-    input_str = args.link
-    try: dl_param = float(args.size)
-    except: dl_param = 0.5
-
-    configs_to_test = []
-    sub_stats = {"upload": 0, "download": 0, "total": 0, "expire": 0, "title": "Unknown"}
-
-    # تشخیص سابسکریپشن: اگر http باشد و حاوی پروتکل‌های تکی نباشد
-    is_sub = input_str.startswith(('http://', 'https://')) and not any(p in input_str for p in ['vless://', 'vmess://', 'trojan://', 'ss://'])
-
-    if is_sub:
         try:
-            req = urllib.request.Request(input_str, headers={'User-Agent': USER_AGENT})
-            with urllib.request.urlopen(req, timeout=15) as r:
-                raw_content = r.read().decode('utf-8', errors='ignore')
-                advanced_log("Downloaded content.", "SUB")
+            if proc:
+                proc.kill()
+                try:
+                    proc.wait(timeout=1)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            if os.path.exists(conf_file):
+                os.remove(conf_file)
+        except Exception:
+            pass
 
-                # استخراج هدرهای استاندارد (UserInfo)
-                headers = r.info()
-                user_info = headers.get('Subscription-Userinfo', '')
-                if user_info:
-                    for part in user_info.split(';'):
-                        if '=' in part:
-                            k, v = part.strip().split('=')
-                            if k in sub_stats: sub_stats[k] = int(v)
+async def run_sys_command(command, timeout=60):
+    try:
+        process = await asyncio.create_subprocess_shell(
+            command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+            output = stdout.decode('utf-8', errors='ignore').strip()
+            err_out = stderr.decode('utf-8', errors='ignore').strip()
+            final_output = output if output else err_out
+            return True, final_output
+        except asyncio.TimeoutError:
+            try: process.kill()
+            except: pass
+            return False, "Error: Command Timed Out"
+    except Exception as e:
+        return False, f"Agent Error: {str(e)}"
+"""Sonar Monitor Agent (WebSocket server).
 
-                # --- 🚀 HTML PARSING LOGIC (PasarGuard Support) ---
-                if "<html" in raw_content.lower():
-                    advanced_log("HTML detected. Parsing...", "PARSE")
-                    
-                    # 1. استخراج نام ساب (Title)
-                    # تلاش برای یافتن تایتل با خط تیره (Amirtn - ...)
-                    title_match = re.search(r'<title>(.*?)\s*(?:-|\|)\s*.*?</title>', raw_content, re.IGNORECASE)
-                    if not title_match:
-                        # تلاش دوم: تایتل ساده
-                        title_match = re.search(r'<title>(.*?)</title>', raw_content, re.IGNORECASE)
-                    
-                    if title_match:
-                        clean_title = title_match.group(1).strip()
-                        if clean_title: sub_stats['title'] = clean_title
+This agent is deployed on remote servers and provides a stable, long-lived
+WebSocket interface for:
+  - get_stats (CPU/RAM/Disk/Traffic/Uptime)
+  - run_cmd (execute system commands with a timeout)
+  - test_config (test a single v2ray/xray config link)
 
-                    # 2. استخراج لینک‌ها از value="..." یا value='...'
-                    # این Regex تمام پروتکل‌ها را داخل کوتیشن پیدا می‌کند
-                    links = re.findall(r'value=[\'"](vless://[^"\']+|vmess://[^"\']+|trojan://[^"\']+|ss://[^"\']+)[\'"]', raw_content)
-                    
-                    for i, l in enumerate(links):
-                        name = f"Config_{i+1}"
-                        # استخراج نام از هشتگ (#Name)
-                        if '#' in l:
-                            try: name = urllib.parse.unquote(l.split('#')[-1]).strip()
-                            except: pass
-                        
-                        # اگر نام در هشتگ نبود، از پارامتر remarks استفاده کن
-                        if name.startswith("Config_"):
-                            try:
-                                parsed = urllib.parse.urlparse(l)
-                                qs = urllib.parse.parse_qs(parsed.query)
-                                if 'remarks' in qs:
-                                    name = qs['remarks'][0].strip()
-                            except: pass
-                            
-                        # اگر باز هم نبود، از Hostname استفاده کن
-                        if name.startswith("Config_"):
-                            try:
-                                parsed = urllib.parse.urlparse(l)
-                                if parsed.hostname:
-                                    name = f"{parsed.hostname}_{i+1}"
-                            except: pass
+Stability improvements in this version:
+  - WebSocket keepalive enabled (ping_interval/ping_timeout)
+  - Persistent connections supported (multiple requests per connection)
+  - Optional token validation (backward compatible)
+  - Better JSON error handling
+"""
 
-                        # اگر vmess بود و هنوز نام نداشت، از داخل json (ps) بردار
-                        if name.startswith("Config_") and l.startswith('vmess://'):
-                            try:
-                                b64 = l.replace('vmess://', '')
-                                j = json.loads(decode_base64(b64))
-                                if 'ps' in j and j['ps']: name = j['ps']
-                            except: pass
-                            
-                        configs_to_test.append({"name": name, "link": l})
-                        
-                # --- STANDARD BASE64 PARSING ---
-                else:
-                    try: decoded = decode_base64(raw_content)
-                    except: decoded = raw_content
-                    patterns = r'(vless://[^\s\n]+|vmess://[^\s\n]+|trojan://[^\s\n]+|ss://[^\s\n]+)'
-                    links = re.findall(patterns, decoded)
-                    for i, l in enumerate(links):
-                        name = f"Config_{i+1}"
-                        if '#' in l:
-                            try: name = urllib.parse.unquote(l.split('#')[-1]).strip()
-                            except: pass
-                        elif l.startswith('vmess://'):
-                            try:
-                                b64 = l.replace('vmess://', '')
-                                j = json.loads(decode_base64(b64))
-                                if 'ps' in j: name = j['ps']
-                            except: pass
-                        configs_to_test.append({"name": name, "link": l})
+# ==============================================================================
+# 🌐 WEBSOCKET SERVER LOGIC
+# ==============================================================================
 
-            advanced_log(f"Found {len(configs_to_test)} configs.", "PARSE")
+async def get_stats():
+    if psutil is None:
+        return {"status": "Offline", "error": "psutil not installed"}
+
+    cpu = psutil.cpu_percent(interval=0.5)
+    ram = psutil.virtual_memory().percent
+    net = psutil.net_io_counters()
+
+    # Disk usage
+    try:
+        disk = psutil.disk_usage('/').percent
+    except Exception:
+        disk = 0
+
+    # محاسبه آپتایم
+    uptime_sec = int(time.time() - psutil.boot_time())
+    uptime_str = str(timedelta(seconds=uptime_sec))  # ساعت:دقیقه:ثانیه
+
+    return {
+        "status": "Online",
+        "cpu": cpu,
+        "ram": ram,
+        "disk": disk,
+        "traffic_gb": round((net.bytes_sent + net.bytes_recv) / (1024**3), 2),
+        "uptime_sec": uptime_sec,
+        "uptime_str": uptime_str
+    }
+
+
+AGENT_TOKEN = None  # Optional shared secret (string). If None => no auth.
+
+
+async def ws_handler(websocket, path=None):
+    """Handle one connected client.
+
+Protocol:
+  1) client sends token (string)
+  2) client sends JSON messages forever (request/response)
+"""
+    try:
+        # 1) Receive token (backward compatible: if AGENT_TOKEN is None, accept anything)
+        try:
+            token = await asyncio.wait_for(websocket.recv(), timeout=12)
+        except asyncio.TimeoutError:
+            return
+
+        if AGENT_TOKEN is not None and str(token) != str(AGENT_TOKEN):
+            try:
+                await websocket.close(code=4001, reason="unauthorized")
+            except Exception:
+                pass
+            return
+
+        # 2) Handle requests
+        async for message in websocket:
+            try:
+                data = json.loads(message)
+            except Exception:
+                try:
+                    await websocket.send(json.dumps({"error": "invalid_json"}))
+                except Exception:
+                    pass
+                continue
+
+            action = data.get('action')
             
-            # چاپ خروجی متا برای بات (JSON)
-            print(json.dumps({
-                "type": "meta", 
-                "total": len(configs_to_test), 
-                "sub_info": sub_stats
-            }, ensure_ascii=False), flush=True)
+            if action == 'get_stats':
+                await websocket.send(json.dumps(await get_stats()))
+                
+            elif action == 'test_config':
+                # اجرای تست کانفیگ داخل پروسه سرور (بدون باز کردن پایتون جدید)
+                # این کار بسیار سریع‌تر از روش SSH است
+                link = data.get('link')
+                size = data.get('size', 0.5)
+                outbound = parse_xray_config(link)
+                if outbound:
+                    # اجرای تست در ترد جداگانه تا وب‌سوکت قفل نشود
+                    loop = asyncio.get_running_loop()
+                    res = await loop.run_in_executor(None, test_config_logic, outbound, size)
+                    # attach extracted name if possible
+                    try:
+                        res['extracted_name'] = extract_name_from_link(link) or ''
+                    except Exception:
+                        pass
+                    await websocket.send(json.dumps(res))
+                else:
+                    await websocket.send(json.dumps({"status": "Fail", "msg": "Parse Error"}))
+                    
+            elif action == 'run_cmd':
+                cmd = data.get('cmd')
+                # استفاده از تایم‌اوت ارسالی (با سقف ایمن)
+                t = data.get('timeout', 120)
+                try:
+                    t = int(float(t))
+                except Exception:
+                    t = 120
+                if t < 3: t = 3
+                if t > 3600: t = 3600
+                ok, output = await run_sys_command(cmd, timeout=t)
+                await websocket.send(json.dumps({"ok": ok, "output": output}))
+            else:
+                # Unknown action
+                try:
+                    await websocket.send(json.dumps({"error": "unknown_action", "action": action}))
+                except Exception:
+                    pass
 
-        except Exception as e:
-            advanced_log(f"Sub Error: {e}", "ERROR")
-            print(json.dumps({"status": "Fail", "msg": f"Sub Error: {str(e)}"}))
-            sys.exit(1)
-    else:
-        # حالت کانفیگ تکی
-        name = "Single_Config"
-        if '#' in input_str:
-             try: name = urllib.parse.unquote(input_str.split('#')[-1]).strip()
-             except: pass
-        elif input_str.startswith('vmess://'):
-             try:
-                 b64 = input_str.replace('vmess://', '')
-                 j = json.loads(decode_base64(b64))
-                 if 'ps' in j: name = j['ps']
-             except: pass
-             
-        configs_to_test.append({"name": name, "link": input_str})
+    except Exception:
+        # Do not crash the server on client errors.
+        pass
 
-    # اجرای تست‌ها
-    for cfg in configs_to_test:
-        outbound = parse_xray_config(cfg['link'])
-        
-        if outbound:
-            res = test_config(outbound, dl_param, config_name=cfg['name'])
-            res['type'] = 'result'
-            res['name'] = cfg['name']
-            res['link'] = cfg['link']
-            # چاپ خروجی نتیجه برای بات
-            print(json.dumps(res, ensure_ascii=False), flush=True)
+async def start_server(port):
+    if websockets is None:
+        raise RuntimeError('websockets not installed. Install with: pip3 install websockets psutil')
+    # Keepalive is crucial for long-lived connections behind NAT/firewalls.
+    async with websockets.serve(
+        ws_handler,
+        "0.0.0.0",
+        port,
+        max_size=None,
+        ping_interval=20,
+        ping_timeout=20,
+    ):
+        await asyncio.Future()
+
+# ==============================================================================
+# 🏁 MAIN ENTRY POINT
+# ==============================================================================
+
+if __name__ == "__main__":
+    install_xray()
+
+    # CLI args (backward compatible):
+    #   python3 monitor_agent.py 8080
+    #   python3 monitor_agent.py 8080 --token "..."
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("port", nargs="?", default="8080")
+    parser.add_argument("--token", dest="token", default=None)
+    args, _ = parser.parse_known_args()
+
+    try:
+        if args.token is not None:
+            AGENT_TOKEN = str(args.token)
+    except Exception:
+        pass
+
+    # حالت 1: اجرا به عنوان سرور وب‌سوکت
+    # (اگر اولین آرگومان عددی باشد => پورت)
+    if str(args.port).isdigit():
+        try:
+            asyncio.run(start_server(int(args.port)))
+        except KeyboardInterrupt:
+            pass
+
+    # حالت 2: اجرا به عنوان ابزار تست (CLI Mode - برای سازگاری با کدهای قدیمی)
+    elif len(sys.argv) >= 2:
+        link = sys.argv[1]
+        size = float(sys.argv[2]) if len(sys.argv) > 2 else 0.5
+
+        # اگر لینک سابسکریپشن بود
+        if link.startswith(("http://", "https://")):
+            raw = fetch_url(link, timeout=25)
+            sub_text = normalize_subscription_text(raw)
+            configs = parse_subscription_links(sub_text)
+
+            sub_info = {
+                "url": link,
+                "total": len(configs),
+                "fetched_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                "mode": "tested" if size and size > 0.5 else "list"
+            }
+
+            # همیشه یک meta چاپ می‌کنیم تا کدهای جدید/قدیمی سازگار باشند
+            print(json.dumps({"type": "meta", "sub_info": sub_info}), flush=True)
+
+            # حالت سریع (فقط لیست)
+            if not size or size <= 0.5:
+                print(json.dumps({"type": "sub", "configs": configs}), flush=True)
+            else:
+                # حالت تست کامل (خروجی استریم به صورت result)
+                for item in configs:
+                    c_link = item.get("link")
+                    c_name = item.get("name", "Unknown")
+                    outbound = parse_xray_config(c_link)
+                    if outbound:
+                        res = test_config_logic(outbound, size)
+                        res.update({
+                            "type": "result",
+                            "name": c_name,
+                            "link": c_link
+                        })
+                        if "extracted_name" not in res:
+                            res["extracted_name"] = c_name
+                        print(json.dumps(res), flush=True)
+                    else:
+                        print(json.dumps({
+                            "type": "result",
+                            "name": c_name,
+                            "link": c_link,
+                            "status": "Fail",
+                            "msg": "Parse Error",
+                            "ping": 0,
+                            "jitter": 0,
+                            "down": 0,
+                            "up": 0,
+                            "score": 0
+                        }), flush=True)
+
+        # اگر کانفیگ تکی بود
         else:
-            advanced_log(f"Parse failed for {cfg['name']}", "WARN")
-            print(json.dumps({"type": "result", "name": cfg['name'], "status": "Fail", "msg": "Parse Failed"}, ensure_ascii=False), flush=True)
+            outbound = parse_xray_config(link)
+            if outbound:
+                res = test_config_logic(outbound, size)
+                try:
+                    res["extracted_name"] = extract_name_from_link(link) or ""
+                except Exception:
+                    pass
+                print(json.dumps(res), flush=True)
+            else:
+                print(json.dumps({"status": "Fail", "msg": "Parse Error"}), flush=True)
+
+    # حالت پیش‌فرض: اجرای سرور روی پورت 8080
+    else:
+        try:
+            asyncio.run(start_server(8080))
+        except Exception:
+            pass
+

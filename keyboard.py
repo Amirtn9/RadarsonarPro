@@ -13,6 +13,18 @@ def back_btn(callback_data='main_menu', text="🔙 بازگشت"):
     """دکمه بازگشت تکی"""
     return InlineKeyboardMarkup([[InlineKeyboardButton(text, callback_data=callback_data)]])
 
+
+def ws_port_confirm_kb() -> InlineKeyboardMarkup:
+    """کیبورد تایید باز بودن پورت وب‌سوکت هنگام افزودن سرور."""
+    kb = [
+        [
+            InlineKeyboardButton("✅ بله، باز است", callback_data='ws_port_ok'),
+            InlineKeyboardButton("❌ نه / مطمئن نیستم", callback_data='ws_port_no'),
+        ],
+        [InlineKeyboardButton("🔙 انصراف", callback_data='cancel_flow')]
+    ]
+    return InlineKeyboardMarkup(kb)
+
 # ==============================================================================
 # 🏠 MAIN MENUS & USER PROFILE
 # ==============================================================================
@@ -96,6 +108,7 @@ def admin_main_kb():
         [InlineKeyboardButton("📜 لیست کل سرورهای کاربران (Full Report)", callback_data='admin_all_servers_1')],
         [InlineKeyboardButton("💳 تنظیمات پرداخت و ولت", callback_data='admin_pay_settings')],
         [InlineKeyboardButton("📡 تنظیمات مانیتورینگ تانل", callback_data='monitor_settings_panel')],
+        [InlineKeyboardButton("🛠 تنظیمات و وضعیت ایجنت‌ها", callback_data='admin_agent_dashboard')],
         [InlineKeyboardButton("🔙 بازگشت", callback_data='main_menu')]
     ]
     return InlineKeyboardMarkup(kb)
@@ -180,6 +193,10 @@ def server_detail_kb(sid, server_ip, is_premium):
             InlineKeyboardButton("💎 ارتقاء کامل", callback_data=f'act_fullupdate_{sid}')
         ],
         [
+            InlineKeyboardButton("🧩 نصب/رفع ایجنت", callback_data=f'act_installagent_{sid}'),
+            InlineKeyboardButton("📜 لاگ ایجنت", callback_data=f'act_agentlog_{sid}')
+        ],
+        [
             InlineKeyboardButton("📅 ویرایش انقضا", callback_data=f'act_editexpiry_{sid}'),
             InlineKeyboardButton("⚠️ راه‌اندازی مجدد", callback_data=f'act_reboot_{sid}')
         ],
@@ -213,6 +230,10 @@ def server_list_kb(servers, group_id=None, is_all=False):
         kb.append(
             [InlineKeyboardButton(f"{status_icon} {s['name']}  |  {s['ip']}", callback_data=f'detail_{s["id"]}')])
     
+    # ابزارهای مدیریت لیست
+    if servers:
+        kb.append([InlineKeyboardButton("🗑 حذف سرویس", callback_data='srv_multidel_start')])
+
     back_cb = 'list_groups_for_servers'
     kb.append([InlineKeyboardButton("🔙 بازگشت", callback_data=back_cb)])
     return InlineKeyboardMarkup(kb)
@@ -302,6 +323,10 @@ def settings_main_kb():
         [
             InlineKeyboardButton("⏰ زمان‌بندی و هشدارها", callback_data='menu_schedules')
         ],
+        # 🔧 اضافه‌شده در ۴.۱: مرکز کرون‌جاب یکپارچه (cronjob_hub.py)
+        [
+            InlineKeyboardButton("🗓 مرکز کرون‌جاب‌ها", callback_data='cronjob_hub_main')
+        ],
         # گزینه‌های منتقل شده از صفحه اصلی
         [
             InlineKeyboardButton("📂 گروه‌بندی سرورها", callback_data='groups_menu'),
@@ -385,6 +410,49 @@ def settings_cron_kb(current_val):
     ]
     return InlineKeyboardMarkup(kb)
 
+def config_cron_kb(current_val):
+    """تنظیمات زمان‌بندی گزارش کانفیگ‌ها (زمان‌های دقیق)"""
+    def get_label(text, value):
+        return f"✅ {text}" if str(value) == str(current_val) else f"🔘 {text}"
+
+    # مقادیر بر حسب دقیقه
+    kb = [
+        [InlineKeyboardButton(get_label("۱۵ دقیقه", 15), callback_data='setconfcron_15'),
+         InlineKeyboardButton(get_label("۳۰ دقیقه", 30), callback_data='setconfcron_30')],
+        
+        [InlineKeyboardButton(get_label("۱ ساعت", 60), callback_data='setconfcron_60'),
+         InlineKeyboardButton(get_label("۲ ساعت", 120), callback_data='setconfcron_120'),
+         InlineKeyboardButton(get_label("۳ ساعت", 180), callback_data='setconfcron_180')],
+        
+        [InlineKeyboardButton(get_label("۱۲ ساعت", 720), callback_data='setconfcron_720'),
+         InlineKeyboardButton(get_label("۲۴ ساعت", 1440), callback_data='setconfcron_1440')],
+        
+        [InlineKeyboardButton(get_label("❌ غیرفعال", 0), callback_data='setconfcron_0')],
+        [InlineKeyboardButton("🔙 بازگشت", callback_data='menu_schedules')]
+    ]
+    return InlineKeyboardMarkup(kb)
+
+def config_cron_kb(current_val):
+    """تنظیمات زمان‌بندی گزارش کانفیگ‌ها (گزینه‌های جدید)"""
+    def get_label(text, value):
+        return f"✅ {text}" if str(value) == str(current_val) else f"🔘 {text}"
+
+    # مقادیر بر حسب دقیقه (چون در هندلر کانفیگ دقیقه ذخیره میکنیم)
+    kb = [
+        [InlineKeyboardButton(get_label("۱۵ دقیقه", 15), callback_data='setconfcron_15'),
+         InlineKeyboardButton(get_label("۳۰ دقیقه", 30), callback_data='setconfcron_30')],
+        
+        [InlineKeyboardButton(get_label("۱ ساعت", 60), callback_data='setconfcron_60'),
+         InlineKeyboardButton(get_label("۲ ساعت", 120), callback_data='setconfcron_120'),
+         InlineKeyboardButton(get_label("۳ ساعت", 180), callback_data='setconfcron_180')],
+        
+        [InlineKeyboardButton(get_label("۱۲ ساعت", 720), callback_data='setconfcron_720'),
+         InlineKeyboardButton(get_label("۲۴ ساعت", 1440), callback_data='setconfcron_1440')],
+        
+        [InlineKeyboardButton(get_label("❌ غیرفعال", 0), callback_data='setconfcron_0')],
+        [InlineKeyboardButton("🔙 بازگشت", callback_data='menu_schedules')]
+    ]
+    return InlineKeyboardMarkup(kb)
 def config_cron_kb(current_val):
     """تنظیمات زمان‌بندی گزارش کانفیگ‌ها"""
     def get_label(text, value):

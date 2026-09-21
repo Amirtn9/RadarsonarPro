@@ -1,0 +1,36 @@
+(
+    GET_NAME, GET_IP, GET_PORT, GET_USER, GET_PASS, SELECT_GROUP,
+    GET_GROUP_NAME, GET_CHANNEL_FORWARD, GET_MANUAL_HOST,
+    ADD_ADMIN_ID, ADD_ADMIN_DAYS, ADMIN_SEARCH_USER,
+    ADMIN_SET_LIMIT, ADMIN_RESTORE_DB, ADMIN_RESTORE_KEY, ADMIN_SET_TIME_MANUAL,
+    GET_CUSTOM_INTERVAL, GET_EXPIRY, GET_CHANNEL_TYPE,
+    EDIT_SERVER_EXPIRY, GET_REMOTE_COMMAND,
+    GET_CPU_LIMIT, GET_RAM_LIMIT, GET_DISK_LIMIT,
+    GET_BROADCAST_MSG, GET_REBOOT_TIME,
+    ADD_PAY_TYPE, ADD_PAY_NET, ADD_PAY_ADDR, ADD_PAY_HOLDER,
+    GET_RECEIPT
+) = range(31)
+
+GET_IRAN_NAME, GET_IRAN_IP, GET_IRAN_PORT, GET_IRAN_USER, GET_IRAN_PASS = range(200, 205)
+
+GET_GROUP_ID_FOR_TOPICS = 400
+
+GET_JSON_CONF, GET_SUB_LINK, GET_CONFIG_LINKS, GET_SUB_NAME, SELECT_CONFIG_TYPE = range(210, 215)
+GET_CUSTOM_BIG_INTERVAL, GET_CUSTOM_BIG_SIZE, GET_CUSTOM_SMALL_SIZE = range(220, 223)
+
+SELECT_ADD_METHOD, GET_LINEAR_DATA = range(100, 102)
+
+ADMIN_GET_UID_FOR_REPORT = 300
+
+# ============================================================================
+# 🔌 NEW STATES (kept out of the main range to avoid breaking existing flows)
+# ============================================================================
+
+# تایید باز بودن پورت وب‌سوکت هنگام افزودن سرور
+CONFIRM_WS_PORT = 105
+
+# گرفتن پورت ایجنت از ادمین (برای نصب/آپدیت گروهی)
+ADMIN_AGENT_PORT_INPUT = 106
+
+# گرفتن پورت WS سفارشی هنگام افزودن سرور (Custom WS Port)
+GET_CUSTOM_WS_PORT = 107

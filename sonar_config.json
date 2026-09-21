@@ -1,4 +1,9 @@
 {
   "bot_token": "8089255042:AAHHqh1zJFHbj6_c5QUTPv_6thKHgNCg2NI",
-  "admin_id": "585214295"
+  "admin_id": "585214295",
+
+  "agent_port": 8080,
+  "ws_pool_max": 5,
+  "ws_ping_interval": 20,
+  "ws_ping_timeout": 20
 }

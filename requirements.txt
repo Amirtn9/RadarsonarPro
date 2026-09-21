@@ -1,0 +1,9 @@
+python-telegram-bot[job-queue]
+paramiko
+cryptography
+jdatetime
+matplotlib
+requests
+psycopg2-binary
+websockets
+psutil

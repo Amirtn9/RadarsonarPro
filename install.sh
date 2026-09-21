@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-# 🦇 SONAR RADAR ULTRA MONITOR 1.5 - AUTO CONFIG MANAGER
+# 🦇 SONAR RADAR ULTRA MONITOR 4.1 - AUTO CONFIG MANAGER
 # ==============================================================================
 
 # --- Configuration ---
@@ -35,7 +35,7 @@ function print_title() {
     echo "     \_/  \`/       \`'  \_/   "
     echo "           \`           \`      "
     echo -e "${RESET}"
-    echo -e "   ${CYAN}${BOLD}🦇 SONAR RADAR ULTRA MONITOR 1.5${RESET}"
+    echo -e "   ${CYAN}${BOLD}🦇 SONAR RADAR ULTRA MONITOR 4.1${RESET}"
     echo -e "   ${BLUE}──────────────────────────────────${RESET}"
     echo ""
 }
@@ -175,7 +175,7 @@ function install_process() {
     if ! git clone "$REPO_URL" "$INSTALL_DIR" > /dev/null 2>&1; then
         print_info "Git clone failed, downloading files manually..."
         # Updated file list to include all required components
-        local FILES=("bot.py" "core.py" "cronjobs.py" "database.py" "keyboard.py" "settings.py" "monitor_agent.py" "admin_panel.py" "server_stats.py" "scoring.py" "tunnel_logic.py" "requirements.txt" "alerts.py" "logger_setup.py" "topics.py")
+        local FILES=("bot.py" "core.py" "cronjobs.py" "database.py" "keyboard.py" "settings.py" "monitor_agent.py" "admin_panel.py" "server_stats.py" "scoring.py" "tunnel_logic.py" "requirements.txt" "alerts.py" "logger_setup.py" "topics.py" "ws_hub.py" "ws_agent.py" "manual_tunnel_install.py" "subscription_scheduler.py" "cronjob_hub.py")
         
         for file in "${FILES[@]}"; do
              curl -s -o "$INSTALL_DIR/$file" "$RAW_URL/$file"
@@ -184,6 +184,15 @@ function install_process() {
 
     if [ -f "$INSTALL_DIR/monitor_agent.py" ]; then
         chmod +x "$INSTALL_DIR/monitor_agent.py"
+    fi
+
+    # آماده‌سازی پوشه لاگ‌های حرفه‌ای (logger_setup.py جدید)
+    mkdir -p "$INSTALL_DIR/logs"
+
+    # باز کردن پورت هاب WebSocket (فاز ۲) در صورت فعال بودن فایروال
+    if command -v ufw > /dev/null 2>&1 && ufw status | grep -q "Status: active"; then
+        ufw allow 8765/tcp > /dev/null 2>&1
+        print_success "پورت 8765 (WebSocket Hub) در فایروال باز شد"
     fi
 
     # 6. Restore Data
@@ -197,7 +206,7 @@ function install_process() {
 
     print_info "Installing Python Libraries"
     pip install --upgrade pip setuptools wheel > /dev/null 2>&1
-    pip install "python-telegram-bot[job-queue]" paramiko cryptography jdatetime matplotlib requests psycopg2-binary > /dev/null 2>&1 &
+    pip install "python-telegram-bot[job-queue]" paramiko cryptography jdatetime matplotlib requests psycopg2-binary websockets > /dev/null 2>&1 &
     show_loading $! "Pip Install..."
 
     # 8. Setup Service

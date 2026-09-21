@@ -1,4 +1,5 @@
 import asyncio
+import io
 import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes, ConversationHandler
@@ -52,12 +53,17 @@ async def set_group_photo(context, group_id):
     """تابع کمکی برای تغییر عکس پروفایل گروه"""
     PHOTO_URL = "https://raw.githubusercontent.com/Amirtn9/Radar-Sonar/main/sonar-radar-logo.png"
     try:
-        # دانلود عکس
+        # دانلود عکس (در ترد جداگانه)
+        def _dl():
+            return requests.get(PHOTO_URL, timeout=15)
+
         loop = asyncio.get_running_loop()
-        response = await loop.run_in_executor(None, requests.get, PHOTO_URL)
-        
+        response = await loop.run_in_executor(None, _dl)
+
         if response.status_code == 200:
-            await context.bot.set_chat_photo(chat_id=group_id, photo=response.content)
+            bio = io.BytesIO(response.content)
+            bio.name = "sonar_group_logo.png"
+            await context.bot.set_chat_photo(chat_id=int(group_id), photo=bio)
             return True, "✅ پروفایل گروه آپدیت شد."
         return False, "❌ دانلود عکس لوگو ناموفق بود."
     except Exception as e:
@@ -72,7 +78,10 @@ async def perform_group_setup(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("❌ آیدی گروه نامعتبر است. باید با -100 شروع شود.")
         return GET_GROUP_ID_FOR_TOPICS
 
-    status_msg = await update.message.reply_text("⏳ **در حال پیکربندی گروه و ساخت تاپیک‌ها...**")
+    status_msg = await update.message.reply_text(
+        "⏳ **در حال پیکربندی گروه و ساخت تاپیک‌ها...**",
+        parse_mode='Markdown'
+    )
     
     # لیست تاپیک‌های حرفه‌ای طبق درخواست
     topics_to_create = [
@@ -97,7 +106,7 @@ async def perform_group_setup(update: Update, context: ContextTypes.DEFAULT_TYPE
         for name, usage, icon_color in topics_to_create:
             try:
                 topic = await context.bot.create_forum_topic(
-                    chat_id=group_id,
+                    chat_id=int(group_id),
                     name=name,
                     icon_color=None
                 )
@@ -116,9 +125,14 @@ async def perform_group_setup(update: Update, context: ContextTypes.DEFAULT_TYPE
             f"🎉 **عملیات با موفقیت پایان یافت!**\n\n"
             f"{created_log}\n\n"
             f"از این پس تمام اعلان‌ها با نظم کامل در تاپیک‌های مربوطه ارسال می‌شوند."
+        ,
+            parse_mode='Markdown'
         )
         
     except Exception as e:
-        await status_msg.edit_text(f"❌ **خطای کلی:**\n{e}\n\nآیا مطمئنید تاپیک‌ها در گروه روشن است و ربات ادمین است؟")
+        await status_msg.edit_text(
+            f"❌ **خطای کلی:**\n{e}\n\nآیا مطمئنید تاپیک‌ها در گروه روشن است و ربات ادمین است؟",
+            parse_mode='Markdown'
+        )
 
     return ConversationHandler.END
