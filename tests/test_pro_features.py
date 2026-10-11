@@ -152,5 +152,20 @@ def test_database_password_has_no_static_fallback():
 
 def test_upgrades_retain_complete_custom_config():
     source=(ROOT/'install.sh').read_text(encoding='utf-8')
-    assert 'cp -p "$INSTALL_DIR/$CONFIG_FILE" "$SOURCE_SNAPSHOT/$CONFIG_FILE"' in source
-    assert 'Do not overwrite it with a two-field object' in source
+    assert 'read_old_config_to_stage' in source
+    assert 'cp -p -- "$INSTALL_DIR/sonar_config.json" "$STAGE/sonar_config.json"' in source
+    assert 'cp -p -- "$INSTALL_DIR/secret.key" "$STAGE/secret.key"' in source
+    assert 'if [[ "$mode" == "update" ]]; then' in source
+    assert 'read_old_config_to_stage' in source.split('install_or_update() {',1)[1]
+
+
+def test_installer_guardrails_for_failed_upgrades():
+    source=(ROOT/'install.sh').read_text(encoding='utf-8')
+    assert 'set -Eeuo pipefail' in source
+    assert 'trap cleanup_and_rollback EXIT' in source
+    assert 'backup_db_if_present' in source
+    assert 'mv -- "$INSTALL_DIR" "$PREVIOUS"' in source
+    assert 'mv -- "$STAGE" "$INSTALL_DIR"' in source
+    assert 'source files' not in source.lower() or 'Install' in source
+    assert 'systemctl is-active --quiet "$SERVICE_NAME" || fail' in source
+    assert 'Use Update (option 2), not Install' in source

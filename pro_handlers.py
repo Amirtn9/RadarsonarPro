@@ -439,6 +439,8 @@ async def rule_command(update,context):
 
 
 async def pdf_report(update,context):
+    if update.callback_query:
+        await update.callback_query.answer()
     uid=update.effective_user.id;owner=owned_context(update,context)
     try:
         from pro_pdf import generate_pdf
