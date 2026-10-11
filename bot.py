@@ -41,7 +41,7 @@ def main():
         print("⛔️ Error: Token not set.")
         return
 
-    print("🚀 SONAR ULTRA PRO v4.3 RUNNING...")
+    print("🚀 SONAR RADAR PRO v5.0 RUNNING...")
     
     # 🔧 نسخه ۴.۲: pool_timeout و سقف صریح آپدیت‌های همزمان اضافه شد تا وقتی
     # چند کاربر همزمان کار سنگین می‌کنند، ارسال پیام‌ها پشت هم گیر نکند.
@@ -49,6 +49,9 @@ def main():
         # 🩺 v4.3: ناظر تاخیر event loop — برای تشخیص اینکه هنگ از کد است یا از CPU سرور
         import runtime
         runtime.start_watchdog(threshold=1.0)
+        # Pro schema migrations fail startup rather than leaving half-working controls.
+        from pro_store import install_schema
+        await asyncio.to_thread(install_schema)
 
     async def _post_shutdown(application):
         try:
@@ -95,6 +98,12 @@ def main():
         app.job_queue.run_repeating(cronjobs.auto_update_subs_job, interval=43200, first=3600)
         app.job_queue.run_repeating(cronjobs.auto_backup_send_job, interval=3600, first=300)
         app.job_queue.run_repeating(cronjobs.check_bonus_expiry_job, interval=43200, first=600)
+        from pro_jobs import multi_probe_job, digest_job, cleanup_job
+        app.job_queue.run_repeating(multi_probe_job, interval=1800, first=300,
+                                    job_kwargs={'max_instances': 1, 'coalesce': True})
+        app.job_queue.run_repeating(digest_job, interval=3600, first=360,
+                                    job_kwargs={'max_instances': 1, 'coalesce': True})
+        app.job_queue.run_daily(cleanup_job, time=dt.time(hour=3, minute=0))
     else:
         logger.error("JobQueue not available.")
 

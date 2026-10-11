@@ -1,5 +1,15 @@
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from settings import SUBSCRIPTION_PLANS
+from telegram import WebAppInfo
+from urllib.parse import urlparse
+import os
+
+def _webapp_button():
+    url=os.getenv('SONAR_WEBAPP_URL','').strip()
+    parsed=urlparse(url)
+    if parsed.scheme=='https' and parsed.hostname:
+        return InlineKeyboardButton('📱 پنل گرافیکی',web_app=WebAppInfo(url=url))
+    return None
 
 # ==============================================================================
 # 🔙 GENERAL & COMMON BUTTONS
@@ -45,12 +55,15 @@ def main_menu_kb(user_id, is_monitor_ready, admin_id):
         [InlineKeyboardButton("📂 مدیریت لیست‌ها (سرور/کانفیگ)", callback_data='open_lists_menu')],
         
         # ردیف ۴: داشبورد
+        [InlineKeyboardButton('📊 مرکز حرفه‌ای سونار', callback_data='pro_home')],
         [InlineKeyboardButton("📊 داشبورد شبکه", callback_data='status_dashboard')],
         
         # ردیف ۵: فقط دکمه تنظیمات باقی ماند
         [InlineKeyboardButton("⚙️ تنظیمات پیشرفته", callback_data='settings_menu')]
     ]
 
+    webapp=_webapp_button()
+    if webapp:kb.insert(1,[webapp])
     if user_id == admin_id:
         kb.insert(0, [InlineKeyboardButton("🤖 مدیریت ربات", callback_data='admin_panel_main')])
 
@@ -58,8 +71,8 @@ def main_menu_kb(user_id, is_monitor_ready, admin_id):
 def account_dashboard_kb():
     """منوی داخلی حساب کاربری و کیف پول"""
     kb = [
-        [InlineKeyboardButton("🔑 دریافت توکن پنل وب", callback_data='gen_web_token')],
-        [InlineKeyboardButton("➕ افزایش موجودی (به زودی)", callback_data='top_up_wallet')], # دکمه نمایشی برای آینده
+        [InlineKeyboardButton('📱 راه‌اندازی پنل گرافیکی', callback_data='gen_web_token')],
+        [InlineKeyboardButton('📊 مرکز حرفه‌ای', callback_data='pro_home')],
         [InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data='main_menu')]
     ]
     return InlineKeyboardMarkup(kb)
@@ -67,7 +80,7 @@ def account_dashboard_kb():
 def user_profile_kb():
     """دکمه‌های پروفایل کاربری"""
     kb = [
-        [InlineKeyboardButton("🔑 دریافت توکن پنل وب (Web Token)", callback_data='gen_web_token')],
+        [InlineKeyboardButton('📱 پنل گرافیکی', callback_data='gen_web_token')],
         [InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data='main_menu')]
     ]
     return InlineKeyboardMarkup(kb)
@@ -279,6 +292,7 @@ def dashboard_main_kb():
             InlineKeyboardButton("📊 وضعیت کانفیگ‌ها (Tunnel)", callback_data='show_config_stats'),
             InlineKeyboardButton("🖥 وضعیت سرورها (VPS)", callback_data='show_server_stats')
         ],
+        [InlineKeyboardButton('📡 مرکز حرفه‌ای سونار', callback_data='pro_home')],
         [InlineKeyboardButton("🔙 منوی اصلی", callback_data='main_menu')]
     ]
     return InlineKeyboardMarkup(kb)
@@ -410,49 +424,7 @@ def settings_cron_kb(current_val):
     ]
     return InlineKeyboardMarkup(kb)
 
-def config_cron_kb(current_val):
-    """تنظیمات زمان‌بندی گزارش کانفیگ‌ها (زمان‌های دقیق)"""
-    def get_label(text, value):
-        return f"✅ {text}" if str(value) == str(current_val) else f"🔘 {text}"
 
-    # مقادیر بر حسب دقیقه
-    kb = [
-        [InlineKeyboardButton(get_label("۱۵ دقیقه", 15), callback_data='setconfcron_15'),
-         InlineKeyboardButton(get_label("۳۰ دقیقه", 30), callback_data='setconfcron_30')],
-        
-        [InlineKeyboardButton(get_label("۱ ساعت", 60), callback_data='setconfcron_60'),
-         InlineKeyboardButton(get_label("۲ ساعت", 120), callback_data='setconfcron_120'),
-         InlineKeyboardButton(get_label("۳ ساعت", 180), callback_data='setconfcron_180')],
-        
-        [InlineKeyboardButton(get_label("۱۲ ساعت", 720), callback_data='setconfcron_720'),
-         InlineKeyboardButton(get_label("۲۴ ساعت", 1440), callback_data='setconfcron_1440')],
-        
-        [InlineKeyboardButton(get_label("❌ غیرفعال", 0), callback_data='setconfcron_0')],
-        [InlineKeyboardButton("🔙 بازگشت", callback_data='menu_schedules')]
-    ]
-    return InlineKeyboardMarkup(kb)
-
-def config_cron_kb(current_val):
-    """تنظیمات زمان‌بندی گزارش کانفیگ‌ها (گزینه‌های جدید)"""
-    def get_label(text, value):
-        return f"✅ {text}" if str(value) == str(current_val) else f"🔘 {text}"
-
-    # مقادیر بر حسب دقیقه (چون در هندلر کانفیگ دقیقه ذخیره میکنیم)
-    kb = [
-        [InlineKeyboardButton(get_label("۱۵ دقیقه", 15), callback_data='setconfcron_15'),
-         InlineKeyboardButton(get_label("۳۰ دقیقه", 30), callback_data='setconfcron_30')],
-        
-        [InlineKeyboardButton(get_label("۱ ساعت", 60), callback_data='setconfcron_60'),
-         InlineKeyboardButton(get_label("۲ ساعت", 120), callback_data='setconfcron_120'),
-         InlineKeyboardButton(get_label("۳ ساعت", 180), callback_data='setconfcron_180')],
-        
-        [InlineKeyboardButton(get_label("۱۲ ساعت", 720), callback_data='setconfcron_720'),
-         InlineKeyboardButton(get_label("۲۴ ساعت", 1440), callback_data='setconfcron_1440')],
-        
-        [InlineKeyboardButton(get_label("❌ غیرفعال", 0), callback_data='setconfcron_0')],
-        [InlineKeyboardButton("🔙 بازگشت", callback_data='menu_schedules')]
-    ]
-    return InlineKeyboardMarkup(kb)
 def config_cron_kb(current_val):
     """تنظیمات زمان‌بندی گزارش کانفیگ‌ها"""
     def get_label(text, value):

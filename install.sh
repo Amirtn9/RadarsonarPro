@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-# 🦇 SONAR RADAR ULTRA MONITOR 4.1 - AUTO CONFIG MANAGER
+# 🦇 SONAR RADAR PRO 5.0 - AUTO CONFIG MANAGER
 # ==============================================================================
 
 # --- Configuration ---
@@ -37,7 +37,7 @@ function print_title() {
     echo "     \_/  \`/       \`'  \_/   "
     echo "           \`           \`      "
     echo -e "${RESET}"
-    echo -e "   ${CYAN}${BOLD}🦇 SONAR RADAR ULTRA MONITOR 4.1${RESET}"
+    echo -e "   ${CYAN}${BOLD}🦇 SONAR RADAR PRO 5.0${RESET}"
     echo -e "   ${BLUE}──────────────────────────────────${RESET}"
     echo ""
 }
@@ -172,6 +172,12 @@ function install_process() {
     tar -C "$SOURCE_DIR" --exclude='./venv' --exclude='./.git' \
         --exclude='./__pycache__' --exclude='./logs' -cf - . | tar -C "$SOURCE_SNAPSHOT" -xf -
 
+    # Preserve the full configuration on upgrades, not only token/admin.
+    # Custom agent ports, WebSocket settings and future flags are part of user data.
+    if [ "$KEEP_CONFIG" = true ] && [ -f "$INSTALL_DIR/$CONFIG_FILE" ]; then
+        cp -p "$INSTALL_DIR/$CONFIG_FILE" "$SOURCE_SNAPSHOT/$CONFIG_FILE"
+    fi
+
     # 3. Replace deployed source
     print_info "Preparing installation directory"
     rm -rf "$INSTALL_DIR"
@@ -182,7 +188,7 @@ function install_process() {
     apt-get update -y > /dev/null 2>&1 &
     show_loading $! "Apt Update..."
     
-    apt-get install -y python3 python3-pip python3-venv git curl bc build-essential libssl-dev libffi-dev python3-dev postgresql postgresql-contrib libpq-dev > /dev/null 2>&1 &
+    apt-get install -y python3 python3-pip python3-venv git curl bc build-essential libssl-dev libffi-dev python3-dev postgresql postgresql-contrib libpq-dev libpango-1.0-0 libpangoft2-1.0-0 fonts-dejavu-core > /dev/null 2>&1 &
     show_loading $! "Installing OS Deps..."
 
     # Configure Database right after installing packages
@@ -213,8 +219,13 @@ function install_process() {
 
     print_info "Installing Python Libraries"
     pip install --upgrade pip setuptools wheel > /dev/null 2>&1
-    pip install -r "$INSTALL_DIR/requirements.txt" > /dev/null 2>&1 &
-    show_loading $! "Pip Install..."
+    pip install -r "$INSTALL_DIR/requirements.txt" > /tmp/sonar-pip-install.log 2>&1 &
+    local pip_pid=$!
+    show_loading "$pip_pid" "Pip Install..."
+    if ! wait "$pip_pid"; then
+        print_error "Dependency install failed. See /tmp/sonar-pip-install.log"
+        return 1
+    fi
 
     # 8. Run the bot under a dedicated account, not root.
     id -u sonar-bot >/dev/null 2>&1 || useradd --system --home-dir "$INSTALL_DIR" --shell /usr/sbin/nologin sonar-bot
@@ -248,7 +259,8 @@ EOF
     # 9. Handle Configuration
     if [ "$KEEP_CONFIG" = true ] && [ -n "$OLD_TOKEN" ]; then
         print_info "Restoring Config (Token & Admin ID)"
-        echo "{\"bot_token\": \"$OLD_TOKEN\", \"admin_id\": \"$OLD_ADMIN\"}" > "$INSTALL_DIR/$CONFIG_FILE"
+        # The full original JSON was copied into SOURCE_SNAPSHOT before replacement.
+        # Do not overwrite it with a two-field object, which would lose custom ports.
         update_settings_py "$OLD_ADMIN"
     else
         configure_token_interactive

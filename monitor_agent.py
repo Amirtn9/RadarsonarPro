@@ -16,6 +16,7 @@ import shutil
 import argparse
 import asyncio
 import hmac
+import ssl
 from datetime import datetime, timedelta
 import logging
 
@@ -679,10 +680,20 @@ async def start_server(port):
     if websockets is None:
         raise RuntimeError('websockets not installed. Install with: pip3 install websockets psutil')
     # Keepalive is crucial for long-lived connections behind NAT/firewalls.
+    tls_cert = os.environ.get('SONAR_AGENT_TLS_CERT', '')
+    tls_key = os.environ.get('SONAR_AGENT_TLS_KEY', '')
+    if bool(tls_cert) != bool(tls_key):
+        raise RuntimeError('Both SONAR_AGENT_TLS_CERT and SONAR_AGENT_TLS_KEY required')
+    ssl_ctx = None
+    if tls_cert:
+        ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ssl_ctx.load_cert_chain(tls_cert, tls_key)
     async with websockets.serve(
         ws_handler,
         os.environ.get("SONAR_AGENT_BIND", "127.0.0.1"),
         port,
+        ssl=ssl_ctx,
         max_size=None,
         # 🔧 v4.3: قبلاً با ping_timeout=20 وقتی CPU نود اشباع می‌شد، ایجنت
         # نمی‌رسید به ping جواب بدهد و websockets *همه* کانکشن‌ها را می‌بست؛

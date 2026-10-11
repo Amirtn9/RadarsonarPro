@@ -84,7 +84,21 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_monitor_ready = await loop.run_in_executor(EXECUTOR, db.is_monitor_active)
     reply_markup = keyboard.main_menu_kb(user_id, is_monitor_ready, SUPER_ADMIN_ID)
 
-    txt = (f"👋 **درود {full_name} عزیز، خوش آمدید!** 🌹\n🦇 **Sonar Radar Ultra Pro**\n➖➖➖➖➖➖➖➖➖➖\n✅ سیستم آماده‌سازی شد.\n📅 اعتبار شما: `{remaining}`\n🔰 گزینه مورد نظر را انتخاب کنید:")
+    try:
+        from pro_store import ProStore
+        summary = await asyncio.to_thread(ProStore().summary, user_id)
+        s,c = summary['servers'],summary['configs']
+        overview = (f"🖥 سرورها: `{s['active']}/{s['total']}` فعال\n"
+                    f"🧩 کانفیگ‌ها: `{c['healthy']}/{c['total']}` سالم\n"
+                    f"🚨 رخدادهای باز: `{summary['incidents']}`")
+    except Exception:
+        overview = "📊 آمار شبکه موقتاً در دسترس نیست"
+
+    txt = ("📡 *SONAR RADAR | Pro 5.0*\n"
+           "━━━━━━━━━━━━━━━━━━━━\n"
+           f"👤 اعتبار حساب: `{remaining}`\n{overview}\n"
+           "━━━━━━━━━━━━━━━━━━━━\n"
+           "از منوی زیر، عملیات مورد نظر را انتخاب کنید.")
 
     if update.callback_query:
         await safe_edit_message(update, txt, reply_markup=reply_markup)
@@ -129,7 +143,12 @@ async def user_profile_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_edit_message(update, txt, reply_markup=reply_markup)
 
 async def web_token_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try: await update.callback_query.answer("🚧 پنل تحت وب در حال توسعه است.\nبه زودی این قابلیت فعال می‌شود!", show_alert=True)
-    except: pass
+    from keyboard import _webapp_button
+    btn = _webapp_button()
+    if btn:
+        markup = InlineKeyboardMarkup([[btn], [InlineKeyboardButton('🔙 بازگشت',callback_data='main_menu')]])
+        await safe_edit_message(update, '📱 **پنل گرافیکی Sonar Radar**\nبا دکمه زیر وارد پنل شوید. ورود تنها با امضای معتبر تلگرام مجاز است.',reply_markup=markup)
+    else:
+        await safe_edit_message(update, '📱 **پنل گرافیکی آماده نصب است.**\nمدیر سرور باید Web API را با HTTPS فعال کند و متغیر SONAR_WEBAPP_URL را تنظیم کند.\nتوکن ساده یا لینک ورود بدون احراز هویت صادر نمی‌شود.',reply_markup=keyboard.back_btn())
 
 # ==============================================================================

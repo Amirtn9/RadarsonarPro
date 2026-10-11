@@ -28,6 +28,8 @@ from states import *
 
 def register_all_handlers(app:  Application):
     logger.debug("📝 Starting handler registration...")
+    from pro_handlers import register as register_pro_handlers
+    register_pro_handlers(app)
     text_filter = filters.TEXT & ~filters.COMMAND
     
     # ==========================================================================

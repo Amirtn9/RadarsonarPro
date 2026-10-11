@@ -1,0 +1,16 @@
+<!DOCTYPE html><html lang="fa" dir="rtl"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#101827"><title>Sonar Radar Pro</title>
+<link rel="stylesheet" href="/static/style.css">
+<script defer src="https://telegram.org/js/telegram-web-app.js"></script><script defer src="/static/app.js"></script>
+</head><body>
+<header class="top"><span class="logo" aria-hidden="true">◉</span><div><strong>SONAR RADAR</strong><small>مرکز مدیریت شبکه</small></div><span id="connection" class="chip">در حال اتصال...</span></header>
+<main>
+<section class="hero"><div><small>نمای کلی شبکه</small><h1>داشبورد مدیریتی</h1><p>سرورها، کانفیگ‌ها و رخدادهای شما در یک نگاه</p></div><button id="refresh" class="soft" type="button" aria-label="بروزرسانی اطلاعات">↻ بروزرسانی</button></section>
+<section class="stats" aria-label="شاخص‌های شبکه"><article><span>سرورهای فعال</span><strong id="srv">—</strong><small>تعداد سرور</small></article><article><span>کانفیگ سالم</span><strong id="cfg">—</strong><small>تعداد کانفیگ</small></article><article><span>رخداد باز</span><strong id="inc">—</strong><small>نیازمند بررسی</small></article></section>
+<nav class="tabs" aria-label="صفحه‌ها"><button data-page="servers" class="selected">سرورها</button><button data-page="configs">کانفیگ‌ها</button><button data-page="rankings">رتبه‌بندی</button><button data-page="incidents">هشدارها</button></nav>
+<section class="panel"><div class="panelhead"><h2 id="section-title">سرورها</h2><label class="search"><span>⌕</span><input id="search" type="search" placeholder="جست‌وجوی نام یا IP..." aria-label="جستجو"></label></div><div id="content" aria-live="polite" class="items"><p class="muted">در حال دریافت داده‌ها...</p></div><div class="paging"><button id="previous" type="button">صفحه قبل</button><span id="page-number">۱</span><button id="next" type="button">صفحه بعد</button></div></section>
+<dialog id="trend" aria-labelledby="trend-title"><div class="trendbar"><h2 id="trend-title">نمودار کیفیت اتصال</h2><button type="button" id="trend-close">✕</button></div><canvas id="trend-canvas" width="620" height="240" role="img" aria-label="نمودار تغییرات پینگ در هفت روز گذشته"></canvas><p id="trend-info" class="muted"></p></dialog>
+<p class="foot">اطلاعات به‌صورت امن از حساب تلگرام شما دریافت می‌شود. آخرین وضعیت، جایگزین تست لحظه‌ای نیست.</p>
+</main><div id="toast" role="status" aria-live="polite"></div>
+</body></html>

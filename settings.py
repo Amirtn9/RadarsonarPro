@@ -2,7 +2,7 @@ import os
 import logging
 import json
 
-PROJECT_VERSION = "4.3"
+PROJECT_VERSION = "5.0-pro"
 
 # ==============================================================================
 # 📂 FILE PATHS CONFIGURATION
@@ -23,7 +23,7 @@ AGENT_FILE_PATH = os.path.join(BASE_DIR, "monitor_agent.py")
 DB_CONFIG = {
     'dbname': 'sonar_ultra_pro',
     'user': 'sonar_user',
-    'password': os.environ.get('SONAR_DB_PASSWORD', 'SonarPassword2025'),
+    'password': os.environ.get('SONAR_DB_PASSWORD', ''),
     'host': 'localhost',
     'port': '5432'
 }

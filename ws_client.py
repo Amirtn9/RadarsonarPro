@@ -24,6 +24,7 @@ import atexit
 import asyncio
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
@@ -309,7 +310,12 @@ class WebSocketPool:
             raise RuntimeError("websockets library missing")
 
         ip, port, token = key
-        uri = f"ws://{ip}:{port}"
+        # WSS enabled explicitly, using the OS CA trust store and hostname validation.
+        # A certificate must contain the connected DNS name / IP in its SAN.
+        secure = os.environ.get('SONAR_WS_TLS', '0') == '1'
+        scheme = 'wss' if secure else 'ws'
+        host = f'[{ip}]' if ':' in ip and not ip.startswith('[') else ip
+        uri = f"{scheme}://{host}:{port}"
 
         ws = await websockets.connect(
             uri,

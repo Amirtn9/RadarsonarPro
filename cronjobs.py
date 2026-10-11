@@ -104,6 +104,12 @@ async def check_single_server_resources(context, srv):
             
             # اگر از حد مجاز گذشت، هشدار بده
             if fail_count >= DOWN_RETRY_LIMIT:
+                if fail_count == DOWN_RETRY_LIMIT:
+                    try:
+                        from pro_store import ProStore
+                        await asyncio.to_thread(ProStore().incident, srv['owner_id'], 'server', sid,
+                                                'server_down', f'قطع ارتباط با سرور {name}', 'critical', True)
+                    except Exception:logger.exception('Pro incident persistence failed')
                 if fail_count == DOWN_RETRY_LIMIT:   # فقط بار اول پیام بده
                     msg = AlertManager.get_down_alert_msg(name, stats. get('error', 'Timeout'))
                     await alert_admin(context, msg)
@@ -112,6 +118,11 @@ async def check_single_server_resources(context, srv):
             # اگر سرور برگشت، ریست کن
             if SERVER_FAILURE_COUNTS.get(sid, 0) > 0:
                 SERVER_FAILURE_COUNTS[sid] = 0
+                try:
+                    from pro_store import ProStore
+                    await asyncio.to_thread(ProStore().incident, srv['owner_id'], 'server',sid,
+                                            'server_down', f'بازیابی سرور {name}', 'critical',False)
+                except Exception:logger.exception('Pro incident resolution failed')
                 # پیام بازگشت (اختیاری)
                 # await alert_admin(context, f"✅ سرور {name} آنلاین شد.")
 

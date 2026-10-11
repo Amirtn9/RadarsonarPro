@@ -2,6 +2,7 @@ import psycopg2
 from psycopg2 import pool
 from psycopg2.extras import RealDictCursor
 import threading
+import os
 import logging
 from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
@@ -62,7 +63,7 @@ class Database:
             last_err = None
             for _ in range(3):
                 try:
-                    self.pool = psycopg2.pool.ThreadedConnectionPool(1, 60, **self.db_config)
+                    self.pool = psycopg2.pool.ThreadedConnectionPool(1, max(2,min(60,int(os.getenv('SONAR_DB_POOL_MAX','60')))), **self.db_config)
                     self._pool_error = None
                     if init_schema:
                         self. init_db()
@@ -533,8 +534,14 @@ class Database:
         """Never use an SSH password as a websocket credential."""
         from core import sec
         with self.get_connection() as (conn, cur):
-            cur.execute("SELECT agent_token FROM servers WHERE ip=%s AND agent_token IS NOT NULL ORDER BY id LIMIT 1", (ip,))
-            row = cur.fetchone()
+            if ws_port:
+                cur.execute("""SELECT agent_token FROM servers
+                        WHERE ip=%s AND agent_token IS NOT NULL AND ws_port IN (%s,0)
+                        ORDER BY (ws_port=%s) DESC,id LIMIT 1""",(ip,int(ws_port),int(ws_port)))
+                row=cur.fetchone()
+            else:
+                cur.execute("SELECT agent_token FROM servers WHERE ip=%s AND agent_token IS NOT NULL ORDER BY id LIMIT 1",(ip,))
+                row=cur.fetchone()
         return sec.decrypt(row['agent_token']) if row else ''
 
     def owns_resource(self, table, resource_id, owner_id):

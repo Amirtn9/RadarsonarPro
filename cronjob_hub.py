@@ -39,8 +39,8 @@ logger = logging.getLogger(__name__)
 def cronjob_hub_kb():
     """منوی اصلی مرکز کرون‌جاب‌ها - نقطه ورود واحد کاربر"""
     kb = [
-        [InlineKeyboardButton("🗓 مرکز کرون‌جاب‌ها", callback_data="header_none")],
 
+        [InlineKeyboardButton('🚨 مرکز رخدادها و هشدارهای پیشرفته',callback_data='pro_prefs')],
         [InlineKeyboardButton("📊 گزارش دوره‌ای سرورها", callback_data="settings_cron")],
         [InlineKeyboardButton("📡 گزارش دوره‌ای کانفیگ‌ها", callback_data="settings_conf_cron")],
         [InlineKeyboardButton("🔄 آپدیت خودکار سابسکریپشن‌ها", callback_data="auto_sub_menu")],

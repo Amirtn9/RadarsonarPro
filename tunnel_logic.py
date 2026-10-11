@@ -80,8 +80,9 @@ class TunnelLogic:
         """(ip, ws_port, token) نود مانیتورینگ."""
         ip = monitor.get('ip')
         ws_port = monitor.get('ws_port') or AGENT_PORT
-        token = self.decrypt(monitor.get('password', ''))
-        return ip, int(ws_port), token
+        # core.ServerMonitor loads a dedicated agent token from the database.
+        # Never decrypt or reuse the SSH password as a WebSocket credential.
+        return ip, int(ws_port), None
 
     async def _test_via_ws(self, monitor: dict, link: str, size: float = 5.0, timeout: int = 60):
         """تست یک کانفیگ روی کانکشن وب‌سوکت پایدار ایجنت."""
@@ -150,6 +151,16 @@ class TunnelLogic:
                     "UPDATE tunnel_configs SET last_status='Fail' WHERE id = ANY(%s)",
                     (list(fail_ids),),
                 )
+            # Persist ordinary/manual test history too, not only Pro opt-in probes.
+            # Batch writes share the existing transaction; failure rolls back all updates.
+            if ok_rows:
+                execute_values(cur, """INSERT INTO pro_metrics(owner_id,config_id,region,ok,ping,jitter)
+                   SELECT c.owner_id,c.id,'default',TRUE,v.ping,v.jitter
+                   FROM (VALUES %s) v(cid,ping,jitter) JOIN tunnel_configs c ON c.id=v.cid""",
+                   [(int(r[-1]),float(r[0]),float(r[1])) for r in ok_rows])
+            if fail_ids:
+                cur.execute("""INSERT INTO pro_metrics(owner_id,config_id,region,ok)
+                   SELECT owner_id,id,'default',FALSE FROM tunnel_configs WHERE id=ANY(%s)""",(list(fail_ids),))
             conn.commit()
 
     def _get_active_monitor(self):
