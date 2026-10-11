@@ -13,8 +13,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # NOTE: پروژه از PostgreSQL استفاده می‌کند. DB_NAME صرفاً برای سازگاری با بخش‌هایی
 # مثل بکاپ‌گیری (خروجی pg_dump) نگه داشته شده است.
 DB_NAME = "sonar_ultra_pro.db"
-CONFIG_FILE = "sonar_config.json"
-KEY_FILE = "secret.key"
+CONFIG_FILE = os.path.join(BASE_DIR, "sonar_config.json")
+KEY_FILE = os.path.join(BASE_DIR, "secret.key")
 AGENT_FILE_PATH = os.path.join(BASE_DIR, "monitor_agent.py")
 
 # ==============================================================================
@@ -23,7 +23,7 @@ AGENT_FILE_PATH = os.path.join(BASE_DIR, "monitor_agent.py")
 DB_CONFIG = {
     'dbname': 'sonar_ultra_pro',
     'user': 'sonar_user',
-    'password': 'SonarPassword2025',
+    'password': os.environ.get('SONAR_DB_PASSWORD', 'SonarPassword2025'),
     'host': 'localhost',
     'port': '5432'
 }

@@ -215,12 +215,12 @@ async def manage_single_sub_menu(update: Update, context: ContextTypes.DEFAULT_T
         page = int(data_parts[3])
     
     with db.get_connection() as (conn, cur):
-        cur.execute("SELECT * FROM tunnel_configs WHERE id=%s", (sub_id,))
+        cur.execute("SELECT * FROM tunnel_configs WHERE id=%s AND owner_id=%s", (sub_id, update.effective_user.id))
         sub = cur.fetchone()
         if not sub:
             await query.answer("❌ اشتراک یافت نشد.", show_alert=True)
             return
-        cur.execute("SELECT id, name, last_status, last_ping FROM tunnel_configs WHERE name LIKE %s AND type='sub_item'", (f"{sub['name']}%",))
+        cur.execute("SELECT id, name, last_status, last_ping FROM tunnel_configs WHERE owner_id=%s AND parent_sub_id=%s AND type='sub_item'", (update.effective_user.id, sub_id))
         items = cur.fetchall()
 
     # ✅ ایمن‌سازی نام برای HTML
@@ -282,13 +282,13 @@ async def get_sub_links_action(update: Update, context: ContextTypes.DEFAULT_TYP
     sub_id = int(query.data.split('_')[3])
     
     with db.get_connection() as (conn, cur):
-        cur.execute("SELECT name FROM tunnel_configs WHERE id=%s", (sub_id,))
+        cur.execute("SELECT name FROM tunnel_configs WHERE id=%s AND owner_id=%s AND type='sub_source'", (update.effective_user.id, sub_id))
         sub = cur.fetchone()
         if not sub:
             await query.answer("❌ اشتراک یافت نشد.", show_alert=True)
             return
             
-        cur.execute("SELECT link, name FROM tunnel_configs WHERE name LIKE %s AND type='sub_item'", (f"{sub['name']}%",))
+        cur.execute("SELECT link, name FROM tunnel_configs WHERE owner_id=%s AND parent_sub_id=%s AND type='sub_item'", (update.effective_user.id, sub_id))
         items = cur.fetchall()
         
     if not items:
@@ -326,13 +326,12 @@ async def delete_full_subscription(update: Update, context: ContextTypes.DEFAULT
     
     # 1. حذف از دیتابیس
     with db.get_connection() as (conn, cur):
-        cur.execute("SELECT name FROM tunnel_configs WHERE id=%s", (sub_id,))
+        cur.execute("SELECT name FROM tunnel_configs WHERE id=%s AND owner_id=%s AND type='sub_source'", (update.effective_user.id, sub_id))
         sub = cur.fetchone()
         if sub:
             # حذف سورس
-            cur.execute("DELETE FROM tunnel_configs WHERE id=%s", (sub_id,))
-            # حذف زیرمجموعه‌ها
-            cur.execute("DELETE FROM tunnel_configs WHERE owner_id=%s AND name LIKE %s", (uid, f"{sub['name']}%"))
+            cur.execute("DELETE FROM tunnel_configs WHERE owner_id=%s AND parent_sub_id=%s AND type='sub_item'", (uid, sub_id))
+            cur.execute("DELETE FROM tunnel_configs WHERE id=%s AND owner_id=%s", (sub_id, uid))
             conn.commit()
             
     # 2. نمایش پیام موفقیت (داخل try برای جلوگیری از کرش)
@@ -1016,127 +1015,36 @@ async def qr_config_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(f"❌ امکان ارسال عکس وجود ندارد.\nلینک:\n`{cfg['link']}`", parse_mode='Markdown')
 
 async def manual_update_sub_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """بروزرسانی دستی یک اشتراک خاص"""
+    """Schedule an async subscription update without blocking the Telegram event loop."""
     query = update.callback_query
+    uid = update.effective_user.id
     sub_id = int(query.data.split('_')[2])
-    
-    await query.answer("⏳ درخواست آپدیت ثبت شد...", show_alert=True)
-    
     with db.get_connection() as (conn, cur):
-        cur.execute("SELECT * FROM tunnel_configs WHERE id=%s", (sub_id,))
+        cur.execute("SELECT * FROM tunnel_configs WHERE id=%s AND owner_id=%s AND type='sub_source'", (sub_id, uid))
         sub = cur.fetchone()
-        cur.execute("SELECT * FROM servers WHERE is_monitor_node=1 AND is_active=1")
+        cur.execute("SELECT * FROM servers WHERE is_monitor_node=1 AND is_active=1 ORDER BY id LIMIT 1")
         monitor = cur.fetchone()
-    
-    if not sub or sub['type'] != 'sub_source':
-        try: await query.message.reply_text("❌ اشتراک یافت نشد.")
-        except: pass
+    if not sub or not monitor:
+        await query.answer("❌ اشتراک یا نود مانیتورینگ یافت نشد.", show_alert=True)
         return
+    await query.answer("⏳ درخواست آپدیت ثبت شد.")
+    context.application.create_task(run_sub_update_background(context, uid, sub, monitor), update=update)
 
-    if not monitor:
-        try: await query.message.reply_text("❌ سرور مانیتورینگ فعال نیست.")
-        except: pass
-        return
 
-    asyncio.create_task(run_sub_update_background(context, update.effective_user.id, sub['link'], sub['name'], sub_id, monitor))
-
-async def run_sub_update_background(context, uid, link, sub_name, sub_id, monitor):
+async def run_sub_update_background(context, uid, sub, monitor):
+    """Run the shared per-user, transactional replacement pipeline."""
+    from tunnel_logic import tunnel_manager
     try:
-        # اطلاع‌رسانی اولیه
-        try:
-            await context.bot.send_message(uid, f"🔄 **فرآیند آپدیت اشتراک {sub_name} آغاز شد...**\n⏳ در حال پاکسازی قدیمی‌ها و دریافت لیست جدید...")
-        except: pass
+        await context.bot.send_message(uid, "🔄 آپدیت اشتراک آغاز شد؛ اطلاعات قبلی تا موفقیت دریافت حفظ می‌شود.")
+        report = await tunnel_manager.process_sub_async(uid, sub, monitor)
+        if report and report[0].startswith("❌"):
+            await context.bot.send_message(uid, report[0])
+        else:
+            await context.bot.send_message(uid, f"✅ آپدیت «{sub['name']}» انجام شد. کانفیگ‌های سالم: {len(report)}")
+    except Exception:
+        logger.exception('Manual subscription update failed for user %s', uid)
+        await context.bot.send_message(uid, "❌ آپدیت ناموفق بود؛ داده‌های قبلی حفظ شدند.")
 
-        # 1. پاکسازی کانفیگ‌های قدیمی این اشتراک (بسیار مهم برای جلوگیری از تکرار)
-        with db.get_connection() as (conn, cur):
-            # حذف تمام زیرمجموعه‌های قبلی که تایپشان sub_item است و نامشان با اسم اشتراک شروع می‌شود
-            cur.execute("DELETE FROM tunnel_configs WHERE owner_id=%s AND name LIKE %s AND type='sub_item'", (uid, f"{sub_name} | %"))
-            conn.commit()
-
-        ip, port, user = monitor['ip'], monitor['port'], monitor['username']
-        password = sec.decrypt(monitor['password'])
-        
-        # استفاده از فلگ -u برای دریافت خروجی لحظه‌ای
-        # FIX: Pass a size argument (>0.5) so agent outputs result lines for sub updates
-        cmd = f"python3 -u /root/monitor_agent.py '{link}' 5.0"
-        
-        client = ServerMonitor.get_ssh_client(ip, port, user, password)
-        stdin, stdout, stderr = client.exec_command(cmd, get_pty=True)
-        
-        new_count = 0
-        active_count = 0
-        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-        # خواندن خروجی خط به خط
-        for line in iter(stdout.readline, ""):
-            line = line.strip()
-            if not line: continue
-            
-            import re
-            json_match = re.search(r'(\{.*\})', line)
-            if json_match:
-                try:
-                    data = json.loads(json_match.group(1))
-                    
-                    # الف) آپدیت اطلاعات حجم (Meta)
-                    if data.get('type') == 'meta' and 'sub_info' in data:
-                        info_str = json.dumps(data['sub_info'])
-                        with db.get_connection() as (conn, cur):
-                            cur.execute("UPDATE tunnel_configs SET sub_info=%s WHERE id=%s", (info_str, sub_id))
-                            conn.commit()
-                            
-                    # ب) افزودن کانفیگ‌های جدید (Result)
-                    elif data.get('type') == 'result':
-                        conf_link = data.get('link')
-                        name = data.get('name', 'Unknown')
-                        status = data.get('status')
-                        ping = data.get('ping', 0) # دریافت پینگ لحظه‌ای
-                        
-                        # محاسبه کیفیت و امتیاز
-                        quality = 10
-                        if status != 'OK':
-                            quality = 0
-                        elif ping > 1000:
-                            quality = 3
-                        elif ping > 500:
-                            quality = 6
-                        
-                        if status == 'OK': active_count += 1
-
-                        # نام نهایی ترکیبی
-                        final_name = f"{sub_name} | {name}"
-                        
-                        with db.get_connection() as (conn, cur):
-                            # درج مستقیم (چون قبلاً قدیمی‌ها را پاک کردیم، نیازی به چک کردن تکراری نیست مگر لینک دقیقاً یکی باشد)
-                            cur.execute(
-                                """INSERT INTO tunnel_configs (owner_id, type, link, name, added_at, quality_score, last_status, last_ping) 
-                                   VALUES (%s, 'sub_item', %s, %s, %s, %s, %s, %s) 
-                                   ON CONFLICT(link) DO UPDATE SET last_status=excluded.last_status, last_ping=excluded.last_ping""",
-                                (uid, conf_link, final_name, now, quality, status, ping)
-                            )
-                            new_count += 1
-                            conn.commit()
-                except: pass
-        
-        client.close()
-        
-        # ارسال گزارش نهایی شیک
-        msg = (
-            f"✅ **آپدیت اشتراک {sub_name} تکمیل شد.**\n"
-            f"➖➖➖➖➖➖➖➖➖➖\n"
-            f"📥 **تعداد کل دریافت شده:** `{new_count}`\n"
-            f"🟢 **کانفیگ‌های سالم:** `{active_count}`\n"
-            f"🗑 کانفیگ‌های منقضی شده حذف شدند."
-        )
-            
-        try:
-            await context.bot.send_message(uid, msg, parse_mode='Markdown')
-        except: pass
-
-    except Exception as e:
-        logger.error(f"Sub Update Error: {e}")
-        try: await context.bot.send_message(uid, f"❌ خطا در آپدیت: {e}")
-        except: pass
 async def delete_item_from_list_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """حذف آیتم و رفرش کردن صحیح لیست"""
     query = update.callback_query
@@ -1617,3 +1525,33 @@ async def set_dns_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """دستور /setting"""
     await settings_menu(update, context)
+
+# ==============================================================================
+# Automatic subscription refresh controls (off by default)
+# ==============================================================================
+async def auto_sub_update_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    current = db.get_setting(uid, 'auto_sub_update_hours') or '0'
+    options = [('خاموش', 0), ('هر ۱۲ ساعت', 12), ('هر ۲۴ ساعت', 24), ('هر ۴۸ ساعت', 48)]
+    buttons = [[InlineKeyboardButton(
+        ('✅ ' if current == str(hours) else '') + label,
+        callback_data=f'set_auto_sub_{hours}')]
+        for label, hours in options]
+    buttons.append([InlineKeyboardButton('🔙 بازگشت', callback_data='cronjob_hub_main')])
+    await safe_edit_message(update,
+        '🔄 **آپدیت خودکار سابسکریپشن‌ها**\n\n'
+        'با فعال‌سازی، کانفیگ‌های هر اشتراک به‌صورت ایمن دریافت و تست می‌شوند. '
+        'اطلاعات قبلی در صورت شکست حفظ می‌شود.\n\n'
+        f'بازه فعلی: `{current}` ساعت',
+        reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def set_auto_sub_update_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    hours = int(update.callback_query.data.split('_')[-1])
+    if hours not in (0, 12, 24, 48):
+        await update.callback_query.answer('❌ بازه نامعتبر', show_alert=True)
+        return
+    await asyncio.get_running_loop().run_in_executor(EXECUTOR, db.set_setting,
+                                                      update.effective_user.id, 'auto_sub_update_hours', str(hours))
+    await update.callback_query.answer('✅ تنظیمات ذخیره شد.')
+    await auto_sub_update_menu(update, context)

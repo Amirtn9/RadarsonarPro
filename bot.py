@@ -70,7 +70,7 @@ def main():
         .write_timeout(60.0)
         .pool_timeout(30.0)
         .connection_pool_size(256)
-        .concurrent_updates(256)
+        .concurrent_updates(False)  # ConversationHandler needs ordered updates
         .post_init(_post_init)
         .post_shutdown(_post_shutdown)
         .build()

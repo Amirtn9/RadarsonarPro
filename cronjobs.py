@@ -118,20 +118,183 @@ async def check_single_server_resources(context, srv):
     except Exception as e:
         logger.error(f"Error checking server {name}: {e}")
 
+# Safe, bounded background work; prevent overlapping job runs.
+_ACTIVE_JOB_TYPES = set()
+
+async def _settings_snapshot():
+    def _query():
+        with db.get_connection() as (conn, cur):
+            cur.execute("SELECT owner_id,key,value FROM settings")
+            return cur.fetchall()
+    rows = await asyncio.get_running_loop().run_in_executor(EXECUTOR, _query)
+    results = {}
+    for row in rows:
+        results.setdefault(row['owner_id'], {})[row['key']] = row['value']
+    return results
+
+
+def _datetime_setting(settings, key):
+    try:
+        return datetime.fromisoformat(settings.get(key, ''))
+    except (TypeError, ValueError):
+        return datetime.min
+
+
 async def monitor_tunnels_job(context: ContextTypes.DEFAULT_TYPE):
-    """مانیتورینگ تانل‌ها (کانفیگ‌ها)"""
-    # فعلا برای جلوگیری از شلوغی لاگ، این بخش را ساده می‌کنیم
-    # لاجیک اصلی در tunnel_logic.py است و دستی فراخوانی می‌شود
-    pass
+    """Periodic config testing for users with enabled config report intervals."""
+    if 'monitor' in _ACTIVE_JOB_TYPES: return
+    _ACTIVE_JOB_TYPES.add('monitor')
+    try:
+        from tunnel_logic import tunnel_manager
+        rows = await asyncio.get_running_loop().run_in_executor(EXECUTOR, _scheduled_items_snapshot)
+        settings = await _settings_snapshot()
+        monitor = await asyncio.get_running_loop().run_in_executor(EXECUTOR, tunnel_manager._get_active_monitor)
+        if not monitor: return
+        now = datetime.now()
+        for uid, configs in rows.items():
+            allowed, _ = await asyncio.get_running_loop().run_in_executor(EXECUTOR, db.check_access, uid)
+            if not allowed: continue
+            st = settings.get(uid, {})
+            try: interval = int(st.get('config_report_interval', '0'))
+            except ValueError: continue
+            if interval <= 0 or (now - _datetime_setting(st, 'last_config_report_at')).total_seconds() < interval * 60:
+                continue
+            # Save the timestamp *before* starting, preventing duplicate overlapping jobs.
+            await asyncio.get_running_loop().run_in_executor(EXECUTOR, db.set_setting, uid, 'last_config_report_at', now.isoformat())
+            try:
+                result = await tunnel_manager.process_singles_async(configs, monitor, uid=uid)
+                await context.bot.send_message(uid,
+                    f'📡 گزارش دوره‌ای: {len(result)} کانفیگ سالم از {len(configs)} مورد' +
+                    ('\n⚠️ برخی کانفیگ‌ها ناموفق هستند.' if len(result) < len(configs) else ''))
+            except Exception:
+                logger.exception('Config monitoring failed for %s', uid)
+    finally:
+        _ACTIVE_JOB_TYPES.discard('monitor')
+
+
+def _scheduled_items_snapshot():
+    with db.get_connection() as (conn, cur):
+        cur.execute("SELECT * FROM tunnel_configs WHERE type='single' ORDER BY owner_id,id")
+        rows = cur.fetchall()
+    by_owner = {}
+    for row in rows:
+        by_owner.setdefault(row['owner_id'], []).append(row)
+    return by_owner
+
+
+async def _exec_user_servers(uid, action, servers=None):
+    if servers is None:
+        servers = await asyncio.get_running_loop().run_in_executor(EXECUTOR, db.get_all_user_servers, uid)
+    allowed = {
+        'update': ('DEBIAN_FRONTEND=noninteractive apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y', 1200),
+        'ram': ('sync && echo 3 > /proc/sys/vm/drop_caches', 30),
+        'disk': ('apt-get autoremove -y && apt-get clean', 240),
+        'full': ('apt-get update -y && apt-get autoremove -y && apt-get clean', 1200),
+        'reboot': ('reboot', 30),
+    }
+    if action not in allowed: raise ValueError('Unsupported global operation')
+    cmd, timeout = allowed[action]
+    semaphore = asyncio.Semaphore(3)
+    async def _one(srv):
+        async with semaphore:
+            def _owned():
+                return db.owns_resource('servers', srv['id'], uid)
+            if not await asyncio.get_running_loop().run_in_executor(EXECUTOR, _owned):
+                return srv['name'], False, 'ownership denied'
+            if not srv.get('is_active'):
+                return srv['name'], False, 'inactive'
+            try:
+                password = sec.decrypt(srv.get('password') or '')
+                ok, msg = await ServerMonitor.run_remote_command(srv['ip'], srv['port'], srv['username'], password, cmd, timeout=timeout)
+                return srv['name'], ok, msg[-250:]
+            except Exception as exc:
+                return srv['name'], False, str(exc)[:250]
+    return await asyncio.gather(*[_one(srv) for srv in servers])
+
+
+async def run_global_commands_background(context, uid, servers, action):
+    """Implementation of the previously missing bulk-operations handler."""
+    try:
+        results = await _exec_user_servers(uid, action, servers)
+        ok = sum(1 for _, success, _ in results if success)
+        detail = '\n'.join(f"{'✅' if good else '❌'} {name}" for name, good, _ in results)
+        await context.bot.send_message(uid, f'🌍 نتیجه عملیات {action}: {ok}/{len(results)} موفق\n{detail}'[:4000])
+    except Exception:
+        logger.exception('Bulk operation failed for %s', uid)
+        await context.bot.send_message(uid, '❌ عملیات همگانی ناموفق بود.')
+
 
 async def auto_scheduler_job(context: ContextTypes.DEFAULT_TYPE):
-    """اجرای تسک‌های زمان‌بندی شده کاربر"""
-    # اگر تسک خاصی دارید اینجا اضافه کنید
-    pass
+    """Apply user's configured update and reboot schedules without event-loop blocking."""
+    if 'schedule' in _ACTIVE_JOB_TYPES: return
+    _ACTIVE_JOB_TYPES.add('schedule')
+    try:
+        settings = await _settings_snapshot()
+        now = get_tehran_datetime().replace(tzinfo=None)
+        for uid, st in settings.items():
+            allowed, _ = await asyncio.get_running_loop().run_in_executor(EXECUTOR, db.check_access, uid)
+            if not allowed: continue
+            try:
+                interval = int(st.get('auto_update_hours', '0'))
+            except ValueError:
+                interval = 0
+            if interval > 0 and (now - _datetime_setting(st, 'last_auto_update_at')).total_seconds() >= interval*3600:
+                await asyncio.get_running_loop().run_in_executor(EXECUTOR, db.set_setting, uid, 'last_auto_update_at', now.isoformat())
+                results = await _exec_user_servers(uid, 'update')
+                await context.bot.send_message(uid, f'🔄 آپدیت زمان‌بندی‌شده: {sum(ok for _,ok,_ in results)}/{len(results)} سرور')
+            reboot = st.get('auto_reboot_config', 'OFF')
+            if reboot and reboot != 'OFF':
+                try:
+                    days_text, hhmm = reboot.split('|')
+                    days = int(days_text)
+                    scheduled_hour = int(hhmm.split(':')[0])
+                    scheduled_minute = int(hhmm.split(':')[1])
+                    due = now.replace(hour=scheduled_hour, minute=scheduled_minute, second=0, microsecond=0)
+                    last = _datetime_setting(st, 'last_reboot_at')
+                    if days > 0 and 0 <= (now-due).total_seconds() < 180 and (now-last).total_seconds() >= days*86400:
+                        await asyncio.get_running_loop().run_in_executor(EXECUTOR, db.set_setting, uid, 'last_reboot_at', now.isoformat())
+                        await _exec_user_servers(uid, 'reboot')
+                except (ValueError, IndexError):
+                    logger.warning('Invalid reboot schedule for %s', uid)
+    except Exception:
+        logger.exception('Auto scheduler failed')
+    finally:
+        _ACTIVE_JOB_TYPES.discard('schedule')
+
 
 async def auto_update_subs_job(context: ContextTypes.DEFAULT_TYPE):
-    """آپدیت خودکار اشتراک‌ها"""
-    pass
+    """Scheduled subscription refresh; off unless auto_sub_update_hours > 0."""
+    if 'subs' in _ACTIVE_JOB_TYPES: return
+    _ACTIVE_JOB_TYPES.add('subs')
+    try:
+        from tunnel_logic import tunnel_manager
+        def _load():
+            with db.get_connection() as (conn, cur):
+                cur.execute("SELECT * FROM tunnel_configs WHERE type='sub_source' ORDER BY owner_id,id")
+                return cur.fetchall()
+        sources = await asyncio.get_running_loop().run_in_executor(EXECUTOR, _load)
+        st_all = await _settings_snapshot()
+        monitor = await asyncio.get_running_loop().run_in_executor(EXECUTOR, tunnel_manager._get_active_monitor)
+        if not monitor: return
+        now = datetime.now()
+        for sub in sources:
+            uid = sub['owner_id']
+            allowed, _ = await asyncio.get_running_loop().run_in_executor(EXECUTOR, db.check_access, uid)
+            if not allowed: continue
+            st = st_all.get(uid, {})
+            try: interval = int(st.get('auto_sub_update_hours', '0'))
+            except ValueError: continue
+            if interval <= 0 or (now - _datetime_setting(st, f'last_sub_{sub["id"]}')).total_seconds() < interval*3600:
+                continue
+            await asyncio.get_running_loop().run_in_executor(EXECUTOR, db.set_setting, uid, f'last_sub_{sub["id"]}', now.isoformat())
+            try:
+                await tunnel_manager.process_sub_async(uid, sub, monitor)
+            except Exception:
+                logger.exception('Auto sub update failed for %s', sub['id'])
+    except Exception:
+        logger.exception('Auto subscription job failed')
+    finally:
+        _ACTIVE_JOB_TYPES.discard('subs')
 
 async def check_expiry_job(context: ContextTypes.DEFAULT_TYPE):
     """بررسی سررسید سرویس‌ها"""
@@ -150,8 +313,23 @@ async def check_expiry_job(context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Expiry Job Error: {e}")
 
 async def check_bonus_expiry_job(context: ContextTypes.DEFAULT_TYPE):
-    """بررسی انقضای هدیه‌ها"""
-    pass
+    """Expire bonus capacity exactly once in a locked database transaction."""
+    def _expire():
+        with db.get_connection() as (conn, cur):
+            now = get_tehran_datetime().strftime('%Y-%m-%d %H:%M:%S')
+            cur.execute('SELECT id,user_id,bonus_limit FROM temp_bonuses WHERE expires_at <= %s FOR UPDATE', (now,))
+            bonuses = cur.fetchall()
+            for b in bonuses:
+                cur.execute('UPDATE users SET server_limit=GREATEST(0,server_limit-%s) WHERE user_id=%s',
+                            (b['bonus_limit'], b['user_id']))
+                cur.execute('DELETE FROM temp_bonuses WHERE id=%s', (b['id'],))
+            conn.commit()
+            return len(bonuses)
+    try:
+        total = await asyncio.get_running_loop().run_in_executor(EXECUTOR, _expire)
+        if total: logger.info('Expired %s bonuses', total)
+    except Exception:
+        logger.exception('Bonus expiry job failed')
 
 async def auto_backup_send_job(context: ContextTypes.DEFAULT_TYPE):
     """ارسال بکاپ خودکار دیتابیس"""
@@ -160,7 +338,9 @@ async def auto_backup_send_job(context: ContextTypes.DEFAULT_TYPE):
         # ✅ PostgreSQL Backup (pg_dump)
         # DB_NAME اینجا به معنای فایل خروجی بکاپ است.
         now = datetime.now().strftime('%Y%m%d_%H%M%S')
-        backup_path = f"/tmp/sonar_auto_backup_{now}.dump"
+        import tempfile
+        fd, backup_path = tempfile.mkstemp(prefix='sonar_auto_backup_', suffix='.dump')
+        os.close(fd)
 
         def _dump():
             env = os.environ.copy()

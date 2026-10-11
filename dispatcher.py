@@ -13,6 +13,11 @@ from telegram.ext import (
     MessageHandler, ConversationHandler, filters
 )
 
+from bot_logic_mod import servers
+from secure_handlers import SecureCallbackQueryHandler, SecureMessageHandler, SecureCommandHandler
+CallbackQueryHandler = SecureCallbackQueryHandler
+MessageHandler = SecureMessageHandler
+CommandHandler = SecureCommandHandler
 import bot_logic
 import admin_panel
 import topics
@@ -311,6 +316,8 @@ def register_all_handlers(app:  Application):
 
         # 🔧 رفع نسخه ۴.۰: این دکمه ساخته شده بود ولی هیچ‌جا رجیستر نشده بود
         '^cronjob_hub_main$': open_cronjob_hub,
+        '^auto_sub_menu$': bot_logic.auto_sub_update_menu,
+        '^set_auto_sub_': bot_logic.set_auto_sub_update_action,
     }
 
     for ptrn, func in simple_patterns.items():

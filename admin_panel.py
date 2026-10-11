@@ -205,7 +205,7 @@ async def admin_agent_dashboard(update: Update, context: ContextTypes.DEFAULT_TY
                 token = sec.decrypt(s['password']) if s.get('password') else ''
                 try:
                     logger.debug(f"🔌 Probing {ip}...")
-                    res = await ServerMonitor.check_full_stats_ws(ip, int(AGENT_PORT), token)
+                    res = await ServerMonitor.check_full_stats_ws(ip, int(s.get('ws_port') or AGENT_PORT), token)
                 except Exception as e:
                     logger.warning(f"⚠️ Probe failed for {ip}: {e}")
                     res = {'status': 'Offline', 'error': str(e)}
@@ -1032,10 +1032,11 @@ async def admin_agent_install_run(update: Update, context: ContextTypes.DEFAULT_
         ssh_port = int(srv.get('port') or 22)
         username = srv.get('username') or 'root'
         password = sec.decrypt(srv['password']) if srv.get('password') else ''
+        chosen_ws_port = int(srv.get('ws_port') or AGENT_PORT)
 
         msg = await safe_edit_message(
             update,
-            f"⏳ در حال آماده‌سازی نصب ایجنت...\n\n🌐 **IP:** `{ip}`\n🔌 **SSH Port:** `{ssh_port}`\n📡 **Agent Port:** `{AGENT_PORT}`",
+            f"⏳ در حال آماده‌سازی نصب ایجنت...\n\n🌐 **IP:** `{ip}`\n🔌 **SSH Port:** `{ssh_port}`\n📡 **Agent Port:** `{chosen_ws_port}`",
         )
 
         loop = asyncio.get_running_loop()
@@ -1054,7 +1055,7 @@ async def admin_agent_install_run(update: Update, context: ContextTypes.DEFAULT_
             ssh_port,
             username,
             password,
-            AGENT_PORT,
+            chosen_ws_port,
         )
 
         if not ok:
@@ -1079,16 +1080,16 @@ async def admin_agent_install_run(update: Update, context: ContextTypes.DEFAULT_
             # 🔧 رفع باگ نسخه ۴.۰: اینجا از متغیر تعریف‌نشده «ws_port» استفاده می‌شد
             # (فقط توی مسیر نصب دسته‌جمعی «همه سرورها» تعریف می‌شد، نه اینجا)
             # نتیجه‌اش NameError بود و تست اتصال تک‌سروری همیشه شکست می‌خورد.
-            stats_or_err = await ServerMonitor.check_full_stats_ws(ip, AGENT_PORT, password)
-            ws_ok = True
+            stats_or_err = await ServerMonitor.check_full_stats_ws(ip, chosen_ws_port, password)
+            ws_ok = bool(isinstance(stats_or_err, dict) and not stats_or_err.get("error"))
         except Exception as e1:
             # اگر در برخی محیط‌ها sync باشد یا حلقه مشکل داشته باشد، در Thread تست می‌کنیم
             try:
                 stats_or_err = await loop.run_in_executor(
                     EXECUTOR,
-                    lambda: asyncio.run(ServerMonitor.check_full_stats_ws(ip, AGENT_PORT, password)),
+                    lambda: asyncio.run(ServerMonitor.check_full_stats_ws(ip, chosen_ws_port, password)),
                 )
-                ws_ok = True
+                ws_ok = bool(isinstance(stats_or_err, dict) and not stats_or_err.get("error"))
             except Exception as e2:
                 ws_ok = False
                 stats_or_err = str(e2) if str(e2) else str(e1)
@@ -1109,7 +1110,7 @@ async def admin_agent_install_run(update: Update, context: ContextTypes.DEFAULT_
         await safe_edit_message(
             update,
             "✅ **ایجنت با موفقیت نصب/آپدیت شد و اتصال WebSocket برقرار است.**\n\n" +
-            f"🌐 `{ip}:{AGENT_PORT}`\n" +
+            f"🌐 `{ip}:{chosen_ws_port}`\n" +
             "می‌توانید از داشبورد ایجنت وضعیت آنلاین/آفلاین را بررسی کنید.",
             message_id=msg.message_id,
             reply_markup=InlineKeyboardMarkup([
@@ -1165,7 +1166,7 @@ async def admin_agent_port_input(update: Update, context: ContextTypes.DEFAULT_T
 
             ip = srv.get("ip")
             ssh_port = int(srv.get("port") or 22)
-            user = srv.get("user") or "root"
+            user = srv.get("username") or "root"
             password = sec.decrypt(srv.get("password", ""))  # encrypted in DB
 
             await safe_edit_message(

@@ -105,75 +105,31 @@ class TunnelLogic:
         # فال‌بک: اگر ایجنت قدیمی بود و fetch_sub نداشت، از حالت CLI استفاده کن
         return await self._fetch_sub_links_cli(monitor, sub_link, timeout=timeout)
 
-    async def _fetch_sub_links_cli(self, monitor: dict, sub_link: str, timeout: int = 120):
-        """فال‌بک سازگاری با ایجنت‌های قدیمی (اجرای CLI روی نود، از طریق ایجنت)."""
-        import shlex
-
-        ip, ws_port, token = self._agent_creds(monitor)
-        cmd = f"python3 -u /root/monitor_agent.py {shlex.quote(sub_link)} 0.5"
-        res = await ServerMonitor.ws_send_command(
-            ip, ws_port, token,
-            {"action": "run_cmd", "cmd": cmd, "timeout": timeout},
-            timeout=timeout + 10,
-        )
-
-        if not isinstance(res, dict) or res.get("error") or not res.get("ok"):
-            err = (res or {}).get("error") or (res or {}).get("output") or "agent unreachable"
-            return False, err, None
-
-        links, sub_info = [], None
-        for line in str(res.get("output", "")).split('\n'):
-            m = re.search(r'(\{.*\})', line.strip())
-            if not m:
-                continue
-            try:
-                data = json.loads(m.group(1))
-            except Exception:
-                continue
-            if data.get('type') == 'meta' and 'sub_info' in data:
-                sub_info = data['sub_info']
-            elif data.get('type') == 'sub':
-                # خروجی حالت سریع: {"type":"sub","configs":[...]}
-                for c in data.get('configs') or []:
-                    if c.get('link'):
-                        links.append({"name": c.get('name', 'Unknown'), "link": c['link']})
-            elif data.get('type') == 'result' and data.get('link'):
-                links.append({"name": data.get('name', 'Unknown'), "link": data['link']})
-
-        return True, links, sub_info
+    async def _fetch_sub_links_cli(self, monitor, sub_link, timeout=120):
+        """Legacy WebSocket shell fallback was intentionally removed for security."""
+        return False, "The agent must support fetch_sub; reinstall the current agent", None
 
     # ==================================================================
     # 💾 DATABASE (همه خارج از event loop)
     # ==================================================================
-    def _bulk_save_sub_items(self, uid, sub_name, rows):
-        """یک‌جا نوشتن نتایج یک اشتراک — به جای یک INSERT به ازای هر کانفیگ."""
+    def _bulk_save_sub_items(self, uid, sub_id, rows):
+        """Replace only this subscription's items, atomically after successful fetch/tests."""
         if not rows:
-            return
+            return False
         with self.db.get_connection() as (conn, cur):
-            execute_values(
-                cur,
-                """INSERT INTO tunnel_configs
-                   (owner_id, type, link, name, added_at, quality_score,
+            # Verify the current owner and source before destructive operations.
+            cur.execute("SELECT id FROM tunnel_configs WHERE id=%s AND owner_id=%s AND type='sub_source' FOR UPDATE",
+                        (sub_id, uid))
+            if not cur.fetchone():
+                return False
+            cur.execute("DELETE FROM tunnel_configs WHERE owner_id=%s AND parent_sub_id=%s AND type='sub_item'",
+                        (uid, sub_id))
+            execute_values(cur, """INSERT INTO tunnel_configs
+                   (owner_id, parent_sub_id, type, link, name, added_at, quality_score,
                     last_status, last_ping, last_jitter, last_speed_down, last_speed_up)
-                   VALUES %s
-                   ON CONFLICT(link) DO UPDATE SET
-                     last_status=EXCLUDED.last_status,
-                     last_ping=EXCLUDED.last_ping,
-                     last_jitter=EXCLUDED.last_jitter,
-                     last_speed_down=EXCLUDED.last_speed_down,
-                     last_speed_up=EXCLUDED.last_speed_up,
-                     quality_score=EXCLUDED.quality_score""",
-                rows,
-            )
+                   VALUES %s ON CONFLICT DO NOTHING""", rows)
             conn.commit()
-
-    def _clear_sub_items(self, uid, sub_name):
-        with self.db.get_connection() as (conn, cur):
-            cur.execute(
-                "DELETE FROM tunnel_configs WHERE owner_id=%s AND name LIKE %s AND type='sub_item'",
-                (uid, f"{sub_name} | %"),
-            )
-            conn.commit()
+            return True
 
     def _save_sub_info(self, sub_id, sub_info):
         with self.db.get_connection() as (conn, cur):
@@ -206,10 +162,10 @@ class TunnelLogic:
         with self.db.get_connection() as (conn, cur):
             cur.execute(
                 """INSERT INTO tunnel_configs (owner_id, type, link, name, added_at, quality_score)
-                   VALUES (%s, 'sub_source', %s, %s, %s, 10) ON CONFLICT(link) DO NOTHING""",
+                   VALUES (%s, 'sub_source', %s, %s, %s, 10) ON CONFLICT DO NOTHING""",
                 (uid, sub_link, sub_name, now),
             )
-            cur.execute("SELECT id FROM tunnel_configs WHERE link=%s AND type='sub_source'", (sub_link,))
+            cur.execute("SELECT id FROM tunnel_configs WHERE owner_id=%s AND link=%s AND type='sub_source'", (uid, sub_link))
             row = cur.fetchone()
             conn.commit()
             return row['id'] if row else None
@@ -223,22 +179,17 @@ class TunnelLogic:
         sub_link = sub['link']
         sub_id = sub['id']
 
-        await run_sync(self._clear_sub_items, uid, sub_name)
-
         ok, links, sub_info = await self._fetch_sub_links(monitor, sub_link)
         if not ok:
             return [f"❌ خطا در اتصال به نود مانیتورینگ: {links}"]
-
-        if sub_info:
-            try:
-                await run_sync(self._save_sub_info, sub_id, sub_info)
-            except Exception as e:
-                logger.warning("save sub_info failed: %s", e)
+        if not links:
+            return ["❌ اشتراک خالی دریافت شد؛ کانفیگ‌های قبلی حفظ شدند."]
 
         # تست موازی با رعایت صف عادلانه
         async def _one(item):
-            async with self.global_sem, self._user_sem(uid):
-                ok_t, data = await self._test_via_ws(monitor, item['link'], size=0.5, timeout=45)
+            async with self._user_sem(uid):
+                async with self.global_sem:
+                    ok_t, data = await self._test_via_ws(monitor, item['link'], size=0.5, timeout=45)
                 return item, (data if ok_t else None)
 
         results = await asyncio.gather(*[_one(i) for i in links], return_exceptions=True)
@@ -259,7 +210,7 @@ class TunnelLogic:
             score = data.get('score', 0) if status == 'OK' else 0
 
             rows.append((
-                uid, 'sub_item', item['link'], full_name, now_dt, score, status,
+                uid, sub_id, 'sub_item', item['link'], full_name, now_dt, score, status,
                 data.get('ping', 0), data.get('jitter', 0),
                 data.get('down', 0), data.get('up', 0),
             ))
@@ -272,15 +223,24 @@ class TunnelLogic:
                 )
 
         # 🚀 یک نوشتن، داخل ترد — نه ۳۰۰ نوشتن روی event loop
-        await run_sync(self._bulk_save_sub_items, uid, sub_name, rows)
+        if not rows or not any(r[7] == 'OK' for r in rows):
+            return ["❌ هیچ کانفیگ سالمی پس از تست دریافت نشد؛ اطلاعات قبلی حفظ شدند."]
+        if not await run_sync(self._bulk_save_sub_items, uid, sub_id, rows):
+            return ["❌ ذخیره کانفیگ‌ها ناموفق بود؛ داده‌های قبلی حفظ شدند."]
+        if sub_info:
+            try:
+                await run_sync(self._save_sub_info, sub_id, sub_info)
+            except Exception as exc:
+                logger.warning('Subscription metadata save failed: %s', exc)
 
         return report_lines
 
     async def process_singles_async(self, singles, monitor: dict, uid=None):
         """پردازش لیست کانفیگ‌های تکی (موازی + ذخیره دسته‌ای)."""
         async def _one(cfg):
-            async with self.global_sem, self._user_sem(uid or cfg.get('owner_id')):
-                ok, data = await self._test_via_ws(monitor, cfg['link'], size=0.5, timeout=45)
+            async with self._user_sem(uid or cfg.get('owner_id')):
+                async with self.global_sem:
+                    ok, data = await self._test_via_ws(monitor, cfg['link'], size=0.5, timeout=45)
                 return cfg, (data if ok else None)
 
         results = await asyncio.gather(*[_one(c) for c in singles], return_exceptions=True)

@@ -7,113 +7,130 @@ from bot_logic_mod.base import *  # noqa
 
 # 👑 ADMIN PANEL HANDLERS
 # ==============================================================================
-async def admin_backup_get(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """دریافت بکاپ دستی Postgres"""
-    try: await update.callback_query.answer("⏳ در حال تهیه بکاپ...")
-    except: pass
+import tempfile
+from pathlib import Path
 
-    timestamp = get_tehran_datetime().strftime("%Y-%m-%d_%H-%M")
-    backup_file = f"manual_backup_{timestamp}.sql"
+async def _admin_denied(update):
+    if update.effective_user.id == SUPER_ADMIN_ID and SUPER_ADMIN_ID:
+        return False
+    msg = update.effective_message
+    if msg:
+        await msg.reply_text('⛔ این عملیات فقط برای مدیر اصلی مجاز است.')
+    return True
 
+
+def _pg_env():
+    env = os.environ.copy()
+    env['PGPASSWORD'] = str(DB_CONFIG.get('password', ''))
+    return env
+
+
+def _pg_base():
+    return ['-h', str(DB_CONFIG.get('host', 'localhost')),
+            '-p', str(DB_CONFIG.get('port', '5432')),
+            '-U', str(DB_CONFIG.get('user', 'postgres'))]
+
+
+async def _pg_process(args, timeout=600):
+    proc = await asyncio.create_subprocess_exec(*args, env=_pg_env(),
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
     try:
-        env = os.environ.copy()
-        env['PGPASSWORD'] = DB_CONFIG['password']
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.communicate()
+        return False, 'Timeout'
+    return proc.returncode == 0, stderr.decode(errors='replace')[-900:]
 
-        cmd = [
-            "pg_dump", "-h", DB_CONFIG['host'], "-U", DB_CONFIG['user'],
-            "-d", DB_CONFIG['dbname'], "-f", backup_file
-        ]
-        
-        proc = await asyncio.create_subprocess_exec(*cmd, env=env)
-        await proc.wait()
 
-        if proc.returncode == 0:
-            await update.callback_query.message.reply_document(
-                document=open(backup_file, 'rb'),
-                caption=f"📦 Manual Backup: {get_jalali_str()}"
-            )
+async def admin_backup_get(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await _admin_denied(update): return
+    with tempfile.TemporaryDirectory(prefix='sonar-backup-') as temp:
+        path = str(Path(temp) / 'sonar_backup.dump')
+        ok, err = await _pg_process(['pg_dump', *_pg_base(), '-Fc', '-f', path,
+                                     str(DB_CONFIG['dbname'])])
+        if ok:
+            with open(path, 'rb') as stream:
+                await update.effective_message.reply_document(stream,
+                    filename='sonar_backup.dump', caption='📦 PostgreSQL custom backup')
         else:
-            await update.callback_query.message.reply_text("❌ خطا در تهیه بکاپ.")
-            
-    except Exception as e:
-        await update.callback_query.message.reply_text(f"❌ خطا: {e}")
-    finally:
-        if os.path.exists(backup_file): os.remove(backup_file)
+            await update.effective_message.reply_text('❌ بکاپ ناموفق بود: ' + err)
+
+
 async def admin_backup_restore_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await safe_edit_message(
-        update,
-        "⚠️ **هشدار:** با آپلود فایل جدید، دیتابیس فعلی بازنویسی می‌شود.\n\n📂 **فایل بکاپ `.sql` را ارسال کنید:**",
-        reply_markup=keyboard.get_cancel_markup()
-    )
+    if await _admin_denied(update): return ConversationHandler.END
+    await safe_edit_message(update,
+        '⚠️ بازیابی اطلاعات، جداول فعلی را بازنویسی می‌کند. فایل `.dump` یا `.sql` ارسال کنید.',
+        reply_markup=keyboard.get_cancel_markup())
     return ADMIN_RESTORE_DB
 
+
 async def admin_backup_restore_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """بازگردانی دیتابیس Postgres از فایل SQL"""
-    doc = update.message.document
-    # چک کردن پسوند فایل (باید sql باشد نه db)
-    if not (doc.file_name.endswith('.sql') or doc.file_name.endswith('.txt')):
-        await update.message.reply_text("❌ فرمت فایل نامعتبر است. لطفاً فایل `.sql` ارسال کنید.")
+    if await _admin_denied(update): return ConversationHandler.END
+    doc = update.message.document if update.message else None
+    if not doc or not doc.file_name or not doc.file_name.lower().endswith(('.dump', '.sql')):
+        await update.message.reply_text('❌ فقط فایل `.dump` یا `.sql` پذیرفته می‌شود.')
         return ADMIN_RESTORE_DB
-
-    temp_name = "temp_restore.sql"
-    f = await doc.get_file()
-    await f.download_to_drive(temp_name)
-
-    msg = await update.message.reply_text("⏳ **در حال بازنشانی دیتابیس...**\n(این عملیات ممکن است کمی طول بکشد)")
-
-    try:
-        env = os.environ.copy()
-        env['PGPASSWORD'] = DB_CONFIG['password']
-
-        # دستور بازگردانی (psql)
-        # نکته: دیتابیس قبلی پاک نمی‌شود، بلکه روی آن نوشته می‌شود. 
-        # اگر می‌خواهید کامل جایگزین شود، باید ابتدا جداول را DROP کنید که کمی پیچیده است.
-        # این دستور استاندارد ریستور است:
-        cmd = [
-            "psql", "-h", DB_CONFIG['host'], "-U", DB_CONFIG['user'],
-            "-d", DB_CONFIG['dbname'], "-f", temp_name
-        ]
-
-        proc = await asyncio.create_subprocess_exec(*cmd, env=env)
-        await proc.wait()
-
-        if proc.returncode == 0:
-            await msg.edit_text("✅ **دیتابیس با موفقیت بازنشانی شد.**\nربات اکنون با داده‌های جدید کار می‌کند.")
-            await start(update, context)
+    if doc.file_size and doc.file_size > 100 * 1024 * 1024:
+        await update.message.reply_text('❌ فایل بزرگ‌تر از ۱۰۰ مگابایت است.')
+        return ADMIN_RESTORE_DB
+    is_dump = doc.file_name.lower().endswith('.dump')
+    with tempfile.TemporaryDirectory(prefix='sonar-restore-') as temp:
+        path = str(Path(temp) / ('restore.dump' if is_dump else 'restore.sql'))
+        tgfile = await doc.get_file()
+        await tgfile.download_to_drive(path)
+        if is_dump:
+            args = ['pg_restore', *_pg_base(), '-d', str(DB_CONFIG['dbname']),
+                    '--clean', '--if-exists', '--no-owner', '--no-privileges', '--single-transaction', path]
         else:
-            await msg.edit_text("❌ خطا در اجرای دستور psql.")
-
-    except Exception as e:
-        await msg.edit_text(f"❌ خطا در بازنشانی: {e}")
-    finally:
-        if os.path.exists(temp_name): os.remove(temp_name)
-    
+            args = ['psql', *_pg_base(), '-v', 'ON_ERROR_STOP=1',
+                    '-d', str(DB_CONFIG['dbname']), '--single-transaction', '-f', path]
+        ok, error = await _pg_process(args, timeout=1200)
+        await update.message.reply_text('✅ بازیابی دیتابیس تمام شد.' if ok
+            else '❌ خطا در بازیابی: ' + error)
     return ConversationHandler.END
+
+
 async def admin_key_backup_get(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not os.path.exists(KEY_FILE):
-        try: await update.callback_query.answer("❌ فایل کلید یافت نشد!", show_alert=True)
-        except: pass
+    if await _admin_denied(update): return
+    if not os.path.isfile(KEY_FILE):
+        await update.effective_message.reply_text('❌ کلید موجود نیست.')
         return
-    await update.callback_query.message.reply_document(document=open(KEY_FILE, 'rb'), caption="🔑 **فایل کلید امنیتی (Secret Key)**\n⚠️ این فایل را برای روز مبادا نگه دارید.")
+    with open(KEY_FILE, 'rb') as stream:
+        await update.effective_message.reply_document(stream, filename='secret.key',
+            caption='🔑 کلید محرمانه؛ در جایی امن نگهداری شود.')
+
 
 async def admin_key_restore_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await safe_edit_message(update, "🗝 **لطفاً فایل secret.key را ارسال کنید:**", reply_markup=keyboard.get_cancel_markup())
+    if await _admin_denied(update): return ConversationHandler.END
+    await safe_edit_message(update, '🗝 فایل secret.key معتبر را ارسال کنید.',
+                            reply_markup=keyboard.get_cancel_markup())
     return ADMIN_RESTORE_KEY
 
+
 async def admin_key_restore_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await _admin_denied(update): return ConversationHandler.END
+    import core
     f = await update.message.document.get_file()
-    await f.download_to_drive("temp_key.key")
-    if os.path.exists(KEY_FILE): os.remove(KEY_FILE)
-    os.rename("temp_key.key", KEY_FILE)
-    global sec
-    sec = Security()
-    await update.message.reply_text("✅ **کلید امنیتی بازیابی شد!**")
-    await start(update, context)
+    with tempfile.TemporaryDirectory(prefix='sonar-key-') as temp:
+        tmp = Path(temp) / 'key'
+        await f.download_to_drive(str(tmp))
+        key = tmp.read_bytes().strip()
+        try:
+            cipher = Fernet(key)
+        except Exception:
+            await update.message.reply_text('❌ فایل کلید نامعتبر است؛ کلید فعلی تغییر نکرد.')
+            return ConversationHandler.END
+        dest = Path(KEY_FILE)
+        swap = dest.with_suffix('.key.new')
+        swap.write_bytes(key + b'\n')
+        swap.chmod(0o600)
+        swap.replace(dest)
+        core.sec.key = key
+        core.sec.cipher = cipher
+    await update.message.reply_text('✅ کلید معتبر جایگزین شد. سرویس را ری‌استارت کنید.')
     return ConversationHandler.END
 
-# ==============================================================================
-# 💳 PAYMENT SETTINGS (ADMIN)
-# ==============================================================================
 async def admin_payment_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     methods = db.get_payment_methods()
     txt = "💳 **مدیریت روش‌های پرداخت**\n\nلیست روش‌های فعال:\n" + ("❌ هیچ روش پرداختی تعریف نشده است." if not methods else "")

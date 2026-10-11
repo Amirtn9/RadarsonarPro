@@ -96,9 +96,11 @@ class Database:
             logger.error(f"⚠️ Database Error: {e}")
             if conn:  conn.rollback()
             raise e
-        except Exception as e: 
-            logger.error(f"⚠️ General Error in DB Context: {e}")
-            raise e
+        except Exception as e:
+            if conn:
+                conn.rollback()
+            logger.error("Database operation failed: %s", e)
+            raise
         finally:
             if conn:
                 try:  cur.close()
@@ -171,6 +173,7 @@ class Database:
                 # 🔧 رفع باگ نسخه ۴.۰: این ستون توسط update_server_ws_port() نوشته می‌شد
                 # ولی هیچ‌جا ساخته نشده بود -> خطای "column ws_port does not exist"
                 cur.execute("ALTER TABLE servers ADD COLUMN IF NOT EXISTS ws_port INTEGER DEFAULT 0")
+                cur.execute("ALTER TABLE servers ADD COLUMN IF NOT EXISTS agent_token TEXT")
             except Exception as e:
                 logger.error(f"مایگریشن ستون‌های سرور ناموفق بود / server columns migration failed: {e}", exc_info=True)
             
@@ -248,6 +251,20 @@ class Database:
                 sub_info TEXT DEFAULT '{}'
             )''')
             
+            # Migration: parent IDs prevent collisions between similarly named subscriptions.
+            cur.execute("ALTER TABLE tunnel_configs ADD COLUMN IF NOT EXISTS parent_sub_id INTEGER")
+            cur.execute("ALTER TABLE tunnel_configs DROP CONSTRAINT IF EXISTS tunnel_configs_link_key")
+            cur.execute("""CREATE UNIQUE INDEX IF NOT EXISTS tunnel_configs_scoped_link_unique
+                ON tunnel_configs (owner_id, type, link, (COALESCE(parent_sub_id, 0)))""")
+            cur.execute("CREATE INDEX IF NOT EXISTS tunnel_configs_sub_children_idx ON tunnel_configs(owner_id, parent_sub_id)")
+            # One-time migration of legacy "name | item" children. Prefer the longest
+            # matching source name to handle source names that are prefixes of others.
+            cur.execute("""UPDATE tunnel_configs child SET parent_sub_id = (
+                SELECT parent.id FROM tunnel_configs parent
+                WHERE parent.owner_id=child.owner_id AND parent.type='sub_source'
+                  AND child.name LIKE replace(replace(parent.name, '%', '\\%'), '_', '\\_') || ' | %' ESCAPE '\\'
+                ORDER BY length(parent.name) DESC, parent.id LIMIT 1
+            ) WHERE child.type='sub_item' AND child.parent_sub_id IS NULL""")
             conn.commit()
 
     def get_tehran_datetime(self):
@@ -429,6 +446,10 @@ class Database:
         from core import sec
         
         g_id = group_id if group_id != 0 else None
+        if g_id is not None:
+            if not self.execute('SELECT 1 AS allowed FROM groups WHERE id=%s AND owner_id=%s',
+                                (g_id, owner_id), fetch='one'):
+                return -3
         user = self.get_user(owner_id)
         current = len(self.get_all_user_servers(owner_id))
         
@@ -450,6 +471,9 @@ class Database:
                     (owner_id, g_id, data['name'], data['ip'], data['port'], data['username'], password, data. get('expiry_date'), loc, now)
                 )
                 server_id = cur.fetchone()['id']
+                ws_port = data.get('ws_port')
+                if ws_port is not None:
+                    cur.execute('UPDATE servers SET ws_port=%s WHERE id=%s', (int(ws_port), server_id))
                 conn.commit()
                 return server_id
             except psycopg2.IntegrityError:
@@ -486,14 +510,50 @@ class Database:
     def update_server_expiry(self, s_id, new_date):
         self.execute('UPDATE servers SET expiry_date = %s WHERE id = %s', (new_date, s_id))
 
+    def get_or_create_agent_token(self, ip, ssh_port=None):
+        """Persist a random, dedicated agent secret, encrypted at rest."""
+        import secrets
+        from core import sec
+        with self.get_connection() as (conn, cur):
+            if ssh_port is None:
+                cur.execute("SELECT id, agent_token FROM servers WHERE ip=%s ORDER BY id LIMIT 1 FOR UPDATE", (ip,))
+            else:
+                cur.execute("SELECT id, agent_token FROM servers WHERE ip=%s AND port=%s ORDER BY id LIMIT 1 FOR UPDATE", (ip, ssh_port))
+            row = cur.fetchone()
+            if not row:
+                raise LookupError("Server must be saved before installing the agent")
+            token = sec.decrypt(row['agent_token'] or '') if row['agent_token'] else ''
+            if not token:
+                token = secrets.token_urlsafe(48)
+                cur.execute("UPDATE servers SET agent_token=%s WHERE id=%s", (sec.encrypt(token), row['id']))
+                conn.commit()
+            return token
+
+    def get_agent_token(self, ip, ws_port=None):
+        """Never use an SSH password as a websocket credential."""
+        from core import sec
+        with self.get_connection() as (conn, cur):
+            cur.execute("SELECT agent_token FROM servers WHERE ip=%s AND agent_token IS NOT NULL ORDER BY id LIMIT 1", (ip,))
+            row = cur.fetchone()
+        return sec.decrypt(row['agent_token']) if row else ''
+
+    def owns_resource(self, table, resource_id, owner_id):
+        if table not in ('servers', 'tunnel_configs', 'groups', 'channels'):
+            return False
+        return bool(self.execute(
+            f"SELECT 1 AS allowed FROM {table} WHERE id=%s AND owner_id=%s",
+            (int(resource_id), int(owner_id)), fetch='one'))
+
     def update_server_ws_port(self, server_id: int, ws_port: int) -> bool:
         """Update websocket port for a server (used for agent install/repair)."""
         try:
-            with self.connect() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("UPDATE servers SET ws_port=%s WHERE id=%s", (int(ws_port), int(server_id)))
-                    conn.commit()
-            return True
+            if not 1 <= int(ws_port) <= 65535:
+                return False
+            with self.get_connection() as (conn, cur):
+                cur.execute("UPDATE servers SET ws_port=%s WHERE id=%s", (int(ws_port), int(server_id)))
+                changed = cur.rowcount
+                conn.commit()
+                return changed == 1
         except Exception as e:
             logger.error("update_server_ws_port failed: %s", e, exc_info=True)
             return False

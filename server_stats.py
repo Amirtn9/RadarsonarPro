@@ -29,7 +29,7 @@ class StatsManager:
         # 1. تلاش با وب‌سوکت (روش سریع - اولویت اول) 
         try:
             # استفاده از پورت اختصاصی ایجنت
-            ws_res = await ServerMonitor.check_full_stats_ws(ip, AGENT_PORT, password)
+            ws_res = await ServerMonitor.check_full_stats_ws(ip, int(ws_port or AGENT_PORT), password)
             if ws_res.get('status') == 'Online':
                 return ws_res
         except Exception as e:

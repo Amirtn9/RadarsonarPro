@@ -15,6 +15,7 @@ import shlex
 import shutil
 import argparse
 import asyncio
+import hmac
 from datetime import datetime, timedelta
 import logging
 
@@ -89,11 +90,22 @@ def decode_base64(data):
 # 🔗 SUBSCRIPTION FETCH & PARSE (CLI MODE SUPPORT)
 # ==============================================================================
 def fetch_url(url, timeout=20):
-    """Download subscription content (bytes)."""
+    """Fetch a bounded HTTPS subscription; reject obvious SSRF targets."""
+    import ipaddress
     try:
+        parsed = urllib.parse.urlsplit(str(url or ''))
+        if parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password:
+            return b''
+        ips = socket.getaddrinfo(parsed.hostname, parsed.port or 443, type=socket.SOCK_STREAM)
+        if not ips or any(not ipaddress.ip_address(row[4][0]).is_global for row in ips):
+            return b''
+        # Disable unvalidated redirects (including redirects to internal services).
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
         req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "*/*"})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.read()
+        with urllib.request.build_opener(NoRedirect).open(req, timeout=timeout) as resp:
+            return resp.read(2 * 1024 * 1024 + 1)[:2 * 1024 * 1024]
     except Exception as e:
         advanced_log(f"Subscription fetch failed: {e}", "SUB")
         return b""
@@ -534,7 +546,7 @@ async def get_stats():
     }
 
 
-AGENT_TOKEN = None  # Optional shared secret (string). If None => no auth.
+AGENT_TOKEN = os.environ.get("SONAR_AGENT_TOKEN", "")  # Required in server mode.
 
 # 🔧 نسخه ۴.۲: کنترل بار روی خود ایجنت.
 # حالا که ربات تست‌ها را موازی و روی وب‌سوکت می‌فرستد، ایجنت باید خودش
@@ -571,13 +583,13 @@ Protocol:
   2) client sends JSON messages forever (request/response)
 """
     try:
-        # 1) Receive token (backward compatible: if AGENT_TOKEN is None, accept anything)
+        # 1) Authentication is mandatory; there is no legacy anonymous mode.
         try:
             token = await asyncio.wait_for(websocket.recv(), timeout=12)
         except asyncio.TimeoutError:
             return
 
-        if AGENT_TOKEN is not None and str(token) != str(AGENT_TOKEN):
+        if not AGENT_TOKEN or not hmac.compare_digest(str(token), AGENT_TOKEN):
             try:
                 await websocket.close(code=4001, reason="unauthorized")
             except Exception:
@@ -649,17 +661,9 @@ Protocol:
                     await websocket.send(json.dumps({"error": f"fetch_sub_failed: {e}"}))
 
             elif action == 'run_cmd':
-                cmd = data.get('cmd')
-                # استفاده از تایم‌اوت ارسالی (با سقف ایمن)
-                t = data.get('timeout', 120)
-                try:
-                    t = int(float(t))
-                except Exception:
-                    t = 120
-                if t < 3: t = 3
-                if t > 3600: t = 3600
-                ok, output = await run_sys_command(cmd, timeout=t)
-                await websocket.send(json.dumps({"ok": ok, "output": output}))
+                # Remote shell via WebSocket is deliberately disabled.
+                # Maintenance commands must use SSH with server ownership checks.
+                await websocket.send(json.dumps({"error": "remote_shell_disabled"}))
             else:
                 # Unknown action
                 try:
@@ -677,7 +681,7 @@ async def start_server(port):
     # Keepalive is crucial for long-lived connections behind NAT/firewalls.
     async with websockets.serve(
         ws_handler,
-        "0.0.0.0",
+        os.environ.get("SONAR_AGENT_BIND", "127.0.0.1"),
         port,
         max_size=None,
         # 🔧 v4.3: قبلاً با ping_timeout=20 وقتی CPU نود اشباع می‌شد، ایجنت
@@ -703,11 +707,10 @@ if __name__ == "__main__":
     parser.add_argument("--token", dest="token", default=None)
     args, _ = parser.parse_known_args()
 
-    try:
-        if args.token is not None:
-            AGENT_TOKEN = str(args.token)
-    except Exception:
-        pass
+    if args.token is not None:
+        AGENT_TOKEN = str(args.token)
+    if str(args.port).isdigit() and len(AGENT_TOKEN) < 32:
+        parser.error("SONAR_AGENT_TOKEN (32+ chars) required for websocket server mode")
 
     # حالت 1: اجرا به عنوان سرور وب‌سوکت
     # (اگر اولین آرگومان عددی باشد => پورت)

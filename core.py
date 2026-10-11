@@ -148,7 +148,17 @@ class ServerMonitor:
     def get_ssh_client(ip, port, user, password):
         """Create SSH connection"""
         client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        # Default to known-host validation to avoid credential theft via SSH MITM.
+        # Explicit trust-on-first-use is available for deployments without known_hosts.
+        client.load_system_host_keys()
+        try:
+            client.load_host_keys(os.path.expanduser('~/.ssh/known_hosts'))
+        except OSError:
+            pass
+        client.set_missing_host_key_policy(
+            paramiko.AutoAddPolicy() if os.getenv('SONAR_SSH_TRUST_ON_FIRST_USE') == '1'
+            else paramiko.RejectPolicy()
+        )
         client.connect(ip, port=port, username=user, password=password, timeout=10)
         return client
 
@@ -173,22 +183,19 @@ class ServerMonitor:
             _, stdout, stderr = client.exec_command(full_cmd, timeout=timeout)
             out = stdout.read().decode().strip()
             err = stderr.read().decode().strip()
-            client.close()
-            return True, (out + "\n" + err).strip()
+            exit_code = stdout.channel.recv_exit_status()
+            result = (out + "\n" + err).strip()
+            return exit_code == 0, result if exit_code == 0 else f"exit={exit_code}: {result}"
         except paramiko.AuthenticationException:
-            if client:
-                try:
-                    client.close()
-                except Exception:
-                    pass
             return False, "AUTH_FAILED"
         except Exception as e:
-            if client:
+            return False, str(e)
+        finally:
+            if client is not None:
                 try:
                     client.close()
                 except Exception:
                     pass
-            return False, str(e)
 
     # ✅ سازگار با install_agent_service (قبلاً صدا زده می‌شد ولی وجود نداشت)
     @staticmethod
@@ -205,10 +212,15 @@ class ServerMonitor:
             return {"error": "websockets lib missing"}
 
         try:
+            from database import Database
+            from runtime import run_sync
+            dedicated_token = await run_sync(Database().get_agent_token, str(ip), int(ws_port))
+            if not dedicated_token:
+                return {"error": "Agent has no registered token; reinstall/repair the agent"}
             return await GLOBAL_WS_POOL.request(
                 ip=str(ip),
                 port=int(ws_port),
-                token=str(token or ""),
+                token=dedicated_token,
                 payload=payload,
                 timeout=float(timeout),
                 retries=2,
@@ -276,23 +288,27 @@ class ServerMonitor:
     @staticmethod
     def install_agent_service(ip, port_ssh, user, password, ws_port):
         """Install/Update Sonar monitor agent via SSH."""
-        AGENT_PATH = "/root/monitor_agent.py"
+        AGENT_PATH = "/opt/sonar-agent/monitor_agent.py"
         VENV_DIR = "/opt/sonar-agent-venv"
         VENV_PY = f"{VENV_DIR}/bin/python"
         VENV_PIP = f"{VENV_DIR}/bin/pip"
         SERVICE_PATH = "/etc/systemd/system/sonar-agent.service"
 
         try:
+            # One strong per-server token, not the SSH password.
+            from database import Database
+            token = Database().get_or_create_agent_token(ip, port_ssh)
             # 1) Upload agent
             script = ServerMonitor._get_agent_script()
             if not script:
                 return False, "monitor_agent.py not found near this file (cannot upload agent)."
 
             upload_cmd = (
+                "install -d -m 0755 /opt/sonar-agent\n"
                 f"cat > {AGENT_PATH} <<'PY'\n"
                 f"{script}\n"
                 "PY\n"
-                f"chmod 700 {AGENT_PATH}\n"
+                f"chmod 755 {AGENT_PATH}\n"
             )
             ok, out = ServerMonitor._ssh_exec_sync(ip, port_ssh, user, password, upload_cmd, timeout=120)
             if not ok:
@@ -307,6 +323,8 @@ class ServerMonitor:
                 f"if [ ! -d {VENV_DIR} ]; then python3 -m venv {VENV_DIR}; fi\n"
                 f"{VENV_PY} -m pip install --upgrade pip\n"
                 f"{VENV_PIP} install --upgrade websockets psutil\n"
+                "id -u sonar-agent >/dev/null 2>&1 || useradd --system --create-home --home-dir /var/lib/sonar-agent --shell /usr/sbin/nologin sonar-agent\n"
+                "chown -R sonar-agent:sonar-agent /opt/sonar-agent /var/lib/sonar-agent\n"
                 "'"
             )
             ok, out = ServerMonitor._ssh_exec_sync(ip, port_ssh, user, password, setup_cmd, timeout=600)
@@ -320,8 +338,16 @@ class ServerMonitor:
                 "After=network.target\n\n"
                 "[Service]\n"
                 "Type=simple\n"
-                "User=root\n"
+                "User=sonar-agent\n"
+                "Group=sonar-agent\n"
+                "WorkingDirectory=/var/lib/sonar-agent\n"
+                "EnvironmentFile=/etc/sonar-agent.env\n"
                 f"ExecStart={VENV_PY} -u {AGENT_PATH} {int(ws_port)}\n"
+                "NoNewPrivileges=true\n"
+                "ProtectSystem=strict\n"
+                "ProtectHome=true\n"
+                "PrivateTmp=true\n"
+                "ReadWritePaths=/var/lib/sonar-agent\n"
                 # 🔧 نسخه ۴.۳: ایجنت با اولویت پایین اجرا می‌شود و حداکثر ۶۰٪
                 # از CPU را می‌گیرد. روی نودهایی که ربات هم همان‌جاست، این خط
                 # جلوی خوابیدن کل ماشین موقع تست کانفیگ را می‌گیرد.
@@ -335,7 +361,13 @@ class ServerMonitor:
                 "[Install]\n"
                 "WantedBy=multi-user.target\n"
             )
+            # The environment file is root-owned. A dedicated service user runs the agent.
+            # The service uses a remote bind only after auth is explicitly installed.
+            import shlex
+            service_env = f"SONAR_AGENT_TOKEN={token}\nSONAR_AGENT_BIND=0.0.0.0\n"
             service_cmd = (
+                f"cat > /etc/sonar-agent.env <<'ENV'\n{service_env}ENV\n"
+                "chmod 600 /etc/sonar-agent.env\n"
                 f"cat > {SERVICE_PATH} <<'SERVICE'\n{service_content}\nSERVICE\n"
                 "systemctl daemon-reload\n"
                 "systemctl enable --now sonar-agent\n"

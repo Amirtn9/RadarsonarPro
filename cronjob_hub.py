@@ -43,6 +43,7 @@ def cronjob_hub_kb():
 
         [InlineKeyboardButton("📊 گزارش دوره‌ای سرورها", callback_data="settings_cron")],
         [InlineKeyboardButton("📡 گزارش دوره‌ای کانفیگ‌ها", callback_data="settings_conf_cron")],
+        [InlineKeyboardButton("🔄 آپدیت خودکار سابسکریپشن‌ها", callback_data="auto_sub_menu")],
         [InlineKeyboardButton("🔄 آپدیت خودکار مخازن سیستم", callback_data="auto_up_menu")],
         [InlineKeyboardButton("⚠️ ریبوت خودکار سرورها", callback_data="auto_reboot_menu")],
         [InlineKeyboardButton("🎚 هشدارها و آستانه منابع", callback_data="menu_schedules")],

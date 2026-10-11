@@ -309,7 +309,10 @@ async def select_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             # ذخیره در دیتابیس
             # 👇 اصلاح مهم: ارسال SUPER_ADMIN_ID به عنوان آرگومان چهارم
-            db.add_server(update.effective_user.id, int(update.callback_query.data), data, SUPER_ADMIN_ID)
+            add_result = db.add_server(update.effective_user.id, int(update.callback_query.data), data, SUPER_ADMIN_ID)
+            if not isinstance(add_result, int) or add_result <= 0:
+                await update.callback_query.message.reply_text('❌ ثبت سرور ناموفق بود؛ محدودیت، گروه نامعتبر یا نام تکراری.')
+                return ConversationHandler.END
             
             # ✅ اجرای سیستم ضد بلاک (Anti-Block)
             try:
@@ -707,7 +710,7 @@ async def server_detail(update: Update, context: ContextTypes.DEFAULT_TYPE, cust
     async def heavy_process_task():
         async with GLOBAL_SEMAPHORE:
             try:
-                res = await ServerMonitor.check_full_stats_ws(srv['ip'], AGENT_PORT, sec.decrypt(srv['password']))
+                res = await ServerMonitor.check_full_stats_ws(srv['ip'], int(srv.get('ws_port') or AGENT_PORT), sec.decrypt(srv['password']))
                 
                 # ✅ اصلاح: محاسبه هوشمند آپتایم (اگر ایجنت قدیمی بود)
                 uptime = res.get('uptime_str')
@@ -719,7 +722,7 @@ async def server_detail(update: Update, context: ContextTypes.DEFAULT_TYPE, cust
 
                 reply_markup = keyboard.server_detail_kb(sid, srv['ip'], True)
 
-                if res['status'] == 'Online':
+                if res.get('status') == 'Online':
                     db.update_status(sid, "Online")
                     
                     # رند کردن اعداد
@@ -1013,7 +1016,7 @@ async def server_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         wait_msg = await update.callback_query.message.reply_text("⏳ **در حال آپدیت فایل مانیتورینگ روی سرور مقصد...**\n(این کار باعث نمایش دقیق آپتایم و ترافیک می‌شود)")
         
         # نصب مجدد ایجنت جدید روی سرور مقصد
-        ok, msg = await loop.run_in_executor(EXECUTOR, ServerMonitor.install_agent_service, srv['ip'], srv['port'], srv['username'], real_pass, AGENT_PORT)
+        ok, msg = await loop.run_in_executor(EXECUTOR, ServerMonitor.install_agent_service, srv['ip'], srv['port'], srv['username'], real_pass, int(srv.get('ws_port') or AGENT_PORT))
         
         if ok:
             await wait_msg.edit_text("✅ **ایجنت با موفقیت آپدیت شد.**\nاکنون دکمه «وضعیت سرور» را بزنید تا اطلاعات دقیق نمایش داده شود.")
@@ -1302,7 +1305,10 @@ async def run_terminal_action(update: Update, context: ContextTypes.DEFAULT_TYPE
         return await close_terminal_session(update, context)
 
     sid = context.user_data.get('term_sid')
-    srv = db.get_server_by_id(sid)
+    srv = db.get_server_by_id(sid) if sid else None
+    if not srv or (update.effective_user.id != SUPER_ADMIN_ID and srv['owner_id'] != update.effective_user.id):
+        await update.message.reply_text('⛔ سرور متعلق به حساب شما نیست.')
+        return ConversationHandler.END
 
     wait_msg = await update.message.reply_text(f"⚙️ `{cmd}` ...")
 
@@ -1339,7 +1345,8 @@ async def close_terminal_session(update: Update, context: ContextTypes.DEFAULT_T
     sid = context.user_data.get('term_sid')
     await server_detail(update, context, custom_sid=sid)
     return ConversationHandler.END
-# ==============================================================================async def get_custom_ws_port(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ==============================================================================
+async def get_custom_ws_port(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Receive a custom WS port from user during server add flow."""
     try:
         text = (update.message.text or "").strip()
