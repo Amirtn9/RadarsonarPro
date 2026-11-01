@@ -49,33 +49,49 @@ from runtime import SHARED_EXECUTOR
 EXECUTOR = SHARED_EXECUTOR
 
 SERVER_FAILURE_COUNTS = {}
+AGENT_FAILURE_COUNTS = {}
 CPU_ALERT_TRACKER = {}
 DAILY_REPORT_USAGE = {}
 TUNNEL_FAIL_STREAKS = {}
 IS_SYSTEM_INITIALIZED = False
 LAST_SERVER_REPORT_MIN = {}
 LAST_CONFIG_REPORT_MIN = {}
+SERVER_HEALTH_SNAPSHOT = {}
 
 # ==============================================================================
 # 🔄 SCHEDULED JOBS
 # ==============================================================================
 
+_GLOBAL_MONITOR_RUNNING = False
+
 async def global_monitor_job(context: ContextTypes.DEFAULT_TYPE):
-    """بررسی وضعیت کلی سرورها (منابع)"""
+    """بررسی وضعیت سرورها با سقف همزمانی و جلوگیری از اجرای هم‌پوشان."""
+    global _GLOBAL_MONITOR_RUNNING
+    if _GLOBAL_MONITOR_RUNNING:
+        logger.warning("Global monitor skipped: previous cycle is still running")
+        return
+    _GLOBAL_MONITOR_RUNNING = True
     try:
         loop = asyncio.get_running_loop()
-        # دریافت لیست سرورهای فعال از دیتابیس
         active_servers = await loop.run_in_executor(EXECUTOR, db.get_active_servers)
-        
         if not active_servers:
             return
+        semaphore = asyncio.Semaphore(5)
+        async def bounded_check(server):
+            async with semaphore:
+                await check_single_server_resources(context, server)
+        results = await asyncio.gather(
+            *(bounded_check(server) for server in active_servers),
+            return_exceptions=True,
+        )
+        for server, result in zip(active_servers, results):
+            if isinstance(result, BaseException):
+                logger.error("Monitor task failed for server_id=%s: %s", server.get('id'), result)
+    except Exception:
+        logger.exception("Global Monitor Job Error")
+    finally:
+        _GLOBAL_MONITOR_RUNNING = False
 
-        for srv in active_servers:
-            # اجرای تسک برای هر سرور بدون بلاک کردن بقیه
-            asyncio.create_task(check_single_server_resources(context, srv))
-            
-    except Exception as e:
-        logger.error(f"Global Monitor Job Error: {e}")
 
 async def check_single_server_resources(context, srv):
     """بررسی منابع یک سرور خاص"""
@@ -88,15 +104,43 @@ async def check_single_server_resources(context, srv):
         password = srv.get('password', '')
         if password:
             try:
-                real_pass = sec. decrypt(password)
-            except Exception: 
-                real_pass = password  # اگر رمزگشایی شکست خورد، خود رو استفاده کن
+                real_pass = sec.decrypt(password)
+            except Exception:
+                logger.exception("Stored SSH credential could not be decrypted for server_id=%s", sid)
+                return
         else:
             real_pass = ""
         
         # 1. دریافت آمار (اول وب‌سوکت، بعد SSH)
         stats = await StatsManager.check_full_stats(ip, srv['port'], srv['username'], real_pass, ws_port=srv.get('ws_port'))
         
+        # Agent health is tracked independently from SSH/host reachability.
+        agent_status = str(stats.get('agent_status') or 'Unknown').lower()
+        if stats.get('status') == 'Online' and agent_status in ('offline', 'online'):
+            agent_failures = AGENT_FAILURE_COUNTS.get(sid, 0)
+            if agent_status == 'offline':
+                agent_failures += 1
+                AGENT_FAILURE_COUNTS[sid] = agent_failures
+                if agent_failures == DOWN_RETRY_LIMIT:
+                    await alert_admin(context, AlertManager.get_agent_down_msg(
+                        name, stats.get('agent_error') or 'Agent is not responding'
+                    ))
+                    try:
+                        from pro_store import ProStore
+                        await asyncio.to_thread(ProStore().incident, srv['owner_id'], 'server', sid,
+                                                'agent_down', f'قطع Agent سرور {name}', 'warning', True)
+                    except Exception:
+                        logger.exception('Agent incident persistence failed')
+            elif agent_status == 'online' and agent_failures:
+                AGENT_FAILURE_COUNTS[sid] = 0
+                await alert_admin(context, AlertManager.get_agent_recovery_msg(name))
+                try:
+                    from pro_store import ProStore
+                    await asyncio.to_thread(ProStore().incident, srv['owner_id'], 'server', sid,
+                                            'agent_down', f'بازیابی Agent سرور {name}', 'warning', False)
+                except Exception:
+                    logger.exception('Agent incident resolution failed')
+
         # 2. بررسی وضعیت آنلاین/آفلاین
         if stats. get('status') == 'Offline':
             fail_count = SERVER_FAILURE_COUNTS.get(sid, 0) + 1
@@ -123,8 +167,8 @@ async def check_single_server_resources(context, srv):
                     await asyncio.to_thread(ProStore().incident, srv['owner_id'], 'server',sid,
                                             'server_down', f'بازیابی سرور {name}', 'critical',False)
                 except Exception:logger.exception('Pro incident resolution failed')
-                # پیام بازگشت (اختیاری)
-                # await alert_admin(context, f"✅ سرور {name} آنلاین شد.")
+                # Notify once on recovery; the failure counter is reset before sending.
+                await alert_admin(context, AlertManager.get_recovery_msg(name))
 
     except Exception as e:
         logger.error(f"Error checking server {name}: {e}")
@@ -141,6 +185,8 @@ async def _settings_snapshot():
     results = {}
     for row in rows:
         results.setdefault(row['owner_id'], {})[row['key']] = row['value']
+    if SUPER_ADMIN_ID:
+        results.setdefault(SUPER_ADMIN_ID, {})
     return results
 
 
@@ -233,6 +279,76 @@ async def run_global_commands_background(context, uid, servers, action):
     except Exception:
         logger.exception('Bulk operation failed for %s', uid)
         await context.bot.send_message(uid, '❌ عملیات همگانی ناموفق بود.')
+
+
+async def server_report_job(context: ContextTypes.DEFAULT_TYPE):
+    """Send owner-scoped periodic reports using the latest observed resource samples."""
+    if 'server_report' in _ACTIVE_JOB_TYPES:
+        return
+    _ACTIVE_JOB_TYPES.add('server_report')
+    try:
+        settings = await _settings_snapshot()
+        now = get_tehran_datetime().replace(tzinfo=None)
+        for uid, st in settings.items():
+            try:
+                interval = int(st.get('server_report_interval', '60' if uid == SUPER_ADMIN_ID else '0'))
+            except (TypeError, ValueError):
+                interval = 0
+            if interval <= 0:
+                continue
+            last = _datetime_setting(st, 'last_server_report_at')
+            if last != datetime.min and (now - last).total_seconds() < interval * 60:
+                continue
+            allowed, _ = await asyncio.get_running_loop().run_in_executor(EXECUTOR, db.check_access, uid)
+            if not allowed:
+                continue
+            servers = await asyncio.get_running_loop().run_in_executor(EXECUTOR, db.get_all_user_servers, uid)
+            if not servers:
+                continue
+            rows = []
+            for srv in servers:
+                sid = int(srv['id'])
+                sample = SERVER_HEALTH_SNAPSHOT.get(sid)
+                if sample and (datetime.now() - sample['checked_at']).total_seconds() <= 180:
+                    current = sample
+                else:
+                    history = await asyncio.get_running_loop().run_in_executor(EXECUTOR, db.get_server_stats, sid)
+                    latest = history[-1] if history else {}
+                    def _fresh(value, max_age=180):
+                        if not value:
+                            return False
+                        try:
+                            stamp = value if isinstance(value, datetime) else datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+                            if stamp.tzinfo:
+                                stamp = stamp.astimezone().replace(tzinfo=None)
+                            return (datetime.now() - stamp).total_seconds() <= max_age
+                        except (TypeError, ValueError):
+                            return False
+                    host_fresh = _fresh(srv.get('last_checked_at'))
+                    agent_fresh = _fresh(srv.get('agent_last_seen'))
+                    current = {
+                        'status': (srv.get('last_status') or 'Unknown') if host_fresh else 'Unknown',
+                        'agent_status': (srv.get('last_agent_status') or 'Unknown') if agent_fresh else 'Unknown',
+                        'cpu': latest.get('cpu'), 'ram': latest.get('ram'),
+                    }
+                rows.append({
+                    'name': srv.get('name'), 'status': current.get('status'),
+                    'agent_status': current.get('agent_status'),
+                    'cpu': current.get('cpu'), 'ram': current.get('ram'),
+                })
+            from alerts import format_periodic_server_report
+            report = format_periodic_server_report(rows, get_jalali_str())
+            try:
+                await context.bot.send_message(chat_id=uid, text=report, parse_mode='Markdown')
+                await asyncio.get_running_loop().run_in_executor(
+                    EXECUTOR, db.set_setting, uid, 'last_server_report_at', now.isoformat()
+                )
+            except Exception:
+                logger.exception('Periodic server report delivery failed for owner_id=%s', uid)
+    except Exception:
+        logger.exception('Periodic server report job failed')
+    finally:
+        _ACTIVE_JOB_TYPES.discard('server_report')
 
 
 async def auto_scheduler_job(context: ContextTypes.DEFAULT_TYPE):
@@ -431,8 +547,17 @@ async def system_startup_notification(context: ContextTypes.DEFAULT_TYPE):
 # ==============================================================================
 
 async def alert_admin(context, text):
-    """ارسال پیام به ادمین اصلی"""
-    if not SUPER_ADMIN_ID: return
+    """ارسال پیام به ادمین اصلی؛ خطاها نباید بی‌صدا حذف شوند."""
+    if not SUPER_ADMIN_ID:
+        return
     try:
         await context.bot.send_message(chat_id=SUPER_ADMIN_ID, text=text, parse_mode='Markdown')
-    except: pass
+    except Exception as exc:
+        logger.exception("Could not deliver administrator alert")
+        if 'parse' in str(exc).lower() or 'entity' in str(exc).lower():
+            try:
+                import re
+                safe_text = re.sub(r'[*_`]', '', str(text))[:4000]
+                await context.bot.send_message(chat_id=SUPER_ADMIN_ID, text=safe_text)
+            except Exception:
+                logger.exception("Plain-text administrator alert fallback failed")

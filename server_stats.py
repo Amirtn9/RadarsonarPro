@@ -1,7 +1,14 @@
 import logging
 import io
 import asyncio
+import os
+import pathlib
 import requests
+os.environ.setdefault('MPLCONFIGDIR', '/tmp/sonar-matplotlib')
+try:
+    pathlib.Path(os.environ['MPLCONFIGDIR']).mkdir(parents=True, exist_ok=True)
+except OSError:
+    pass
 import matplotlib
 # تنظیم بک‌اند نمودار برای اجرا در سرور بدون محیط گرافیکی
 matplotlib.use('Agg')
@@ -26,11 +33,15 @@ class StatsManager:
         """
         دریافت آمار به صورت هوشمند (اول وب‌سوکت، اگر نشد SSH)
         """
-        # 1. تلاش با وب‌سوکت (روش سریع - اولویت اول) 
+        # 1. تلاش با وب‌سوکت (روش سریع - اولویت اول)
+        ws_res = {}
         try:
             # استفاده از پورت اختصاصی ایجنت
             ws_res = await ServerMonitor.check_full_stats_ws(ip, int(ws_port or AGENT_PORT), password)
             if ws_res.get('status') == 'Online':
+                ws_res['agent_status'] = 'Online'
+                ws_res['agent_error'] = None
+                ws_res['status_source'] = 'agent'
                 return ws_res
         except Exception as e:
             logger.warning(f"WS Check failed for {ip}: {e}")
@@ -40,11 +51,22 @@ class StatsManager:
         try:
             loop = asyncio.get_running_loop()
             # اجرای متد همگام SSH در ترد جداگانه برای جلوگیری از قفل شدن ربات
-            ssh_res = await loop.run_in_executor(SHARED_EXECUTOR, ServerMonitor.check_full_stats, ip, port, user, password)  # 🔧 v4.2
+            ssh_res = await loop.run_in_executor(SHARED_EXECUTOR, ServerMonitor.check_full_stats, ip, port, user, password)
+            # SSH reachability proves the host is up; it does not prove that the
+            # monitoring agent is healthy. Keep the two states independent.
+            if ssh_res.get('status') == 'Online':
+                ssh_res['agent_status'] = 'Offline'
+                ssh_res['agent_error'] = (ws_res.get('error') if isinstance(ws_res, dict) else None) or 'Agent unavailable'
+                ssh_res['status_source'] = 'ssh'
+            else:
+                ssh_res['agent_status'] = 'Offline'
+                ssh_res['agent_error'] = (ws_res.get('error') if isinstance(ws_res, dict) else None) or ssh_res.get('error')
+                ssh_res['status_source'] = 'unreachable'
             return ssh_res
         except Exception as e:
             logger.error(f"SSH Check failed for {ip}: {e}")
-            return {'status': 'Offline', 'error': 'Connection Failed', 'cpu': 0, 'ram': 0}
+            return {'status': 'Offline', 'agent_status': 'Offline', 'status_source': 'unreachable',
+                    'error': 'Connection Failed', 'cpu': 0, 'ram': 0}
 
     @staticmethod
     def check_host_api(target):

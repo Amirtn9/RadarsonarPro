@@ -9,12 +9,13 @@ import json
 import logging
 import os
 from pathlib import Path
-from fastapi import FastAPI, Depends, HTTPException, Header, Query, Request
+from fastapi import FastAPI, Depends, HTTPException, Header, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from pro_auth import verify_init_data
 from pro_store import ProStore
+from database import Database
 
 log=logging.getLogger(__name__)
 BASE=Path(__file__).resolve().parent
@@ -120,3 +121,113 @@ async def acknowledge(body:IncidentAction,uid:int=Depends(actor)):
 async def set_preferences(body:PreferencesUpdate,uid:int=Depends(actor)):
     await guarded(store.set_preference,uid,body.owner or uid,body.key,body.value)
     return {'ok':True}
+
+
+@app.websocket('/api/terminal')
+async def ssh_terminal(websocket: WebSocket):
+    """Interactive SSH PTY. Auth and ownership are checked before SSH is opened."""
+    await websocket.accept()
+    client = None
+    channel = None
+    owner_id = None
+    actor_id = None
+    server_id = None
+    try:
+        # First frame carries signed Telegram initData; never put it in the URL.
+        first = await asyncio.wait_for(websocket.receive_text(), timeout=10)
+        payload = json.loads(first)
+        init_data = str(payload.get('init_data') or '')
+        server_id = int(payload.get('server_id') or 0)
+        actor_id = verify_init_data(init_data, get_bot_token())
+        allowed, _ = await asyncio.to_thread(store.db.check_access, actor_id)
+        if not allowed:
+            await websocket.close(code=4403)
+            return
+        server = await asyncio.to_thread(Database().get_server_by_id, server_id)
+        if not server:
+            await websocket.close(code=4404)
+            return
+        owner_id = int(server.get('owner_id') or 0)
+        await asyncio.to_thread(store.require, actor_id, owner_id, True)
+        # Verify the resource belongs to the workspace before reading credentials.
+        if not await asyncio.to_thread(store.resource, owner_id, 'server', server_id):
+            await websocket.close(code=4404)
+            return
+        encrypted = server.get('password') or ''
+        if not encrypted:
+            await websocket.send_text(json.dumps({'type':'error','message':'برای این سرور رمز SSH ذخیره نشده است.'}))
+            await websocket.close(code=4401)
+            return
+        ip = str(server.get('ip') or '')
+        port = int(server.get('port') or 22)
+        username = str(server.get('username') or 'root')
+        if not ip or not (1 <= port <= 65535) or not username:
+            await websocket.close(code=4400)
+            return
+        from core import ServerMonitor, sec
+        password = await asyncio.to_thread(sec.decrypt, encrypted)
+        client = await asyncio.to_thread(ServerMonitor.get_ssh_client, ip, port, username, password)
+        transport = client.get_transport()
+        if not transport or not transport.is_active():
+            raise ConnectionError('SSH transport did not become active')
+        channel = transport.open_session(timeout=10)
+        channel.get_pty(term='xterm-256color', width=120, height=36)
+        channel.invoke_shell()
+        await asyncio.to_thread(store.audit, owner_id, actor_id, 'ssh_terminal_open', f'server:{server_id}', 'Interactive SSH session opened')
+        await websocket.send_text(json.dumps({'type':'ready','server':str(server.get('name') or ip)}))
+        while True:
+            # Drain SSH output without blocking the ASGI event loop.
+            if channel.recv_ready():
+                chunk = await asyncio.to_thread(channel.recv, 65536)
+                if not chunk:
+                    break
+                await websocket.send_text(chunk.decode('utf-8', 'replace'))
+            if channel.recv_stderr_ready():
+                chunk = await asyncio.to_thread(channel.recv_stderr, 16384)
+                if chunk:
+                    await websocket.send_text(chunk.decode('utf-8', 'replace'))
+            try:
+                incoming = await asyncio.wait_for(websocket.receive_text(), timeout=0.025)
+            except asyncio.TimeoutError:
+                if channel.exit_status_ready():
+                    break
+                continue
+            try:
+                message = json.loads(incoming)
+            except (ValueError, TypeError):
+                message = {'type':'input','data':incoming}
+            kind = message.get('type')
+            if kind == 'input':
+                data = str(message.get('data') or '')
+                if len(data) > 8192:
+                    continue
+                await asyncio.to_thread(channel.send, data)
+            elif kind == 'resize':
+                cols = max(40, min(300, int(message.get('cols') or 120)))
+                rows = max(10, min(100, int(message.get('rows') or 36)))
+                await asyncio.to_thread(channel.resize_pty, width=cols, height=rows)
+            elif kind == 'close':
+                break
+    except WebSocketDisconnect:
+        pass
+    except (PermissionError, ValueError, KeyError, json.JSONDecodeError):
+        try: await websocket.close(code=4403)
+        except Exception: pass
+    except Exception as exc:
+        log.warning('SSH terminal failed for server_id=%s error_type=%s', server_id, type(exc).__name__)
+        try:
+            await websocket.send_text(json.dumps({'type':'error','message':'اتصال SSH برقرار نشد؛ تنظیمات دسترسی و Host Key را بررسی کنید.'}))
+            await websocket.close(code=1011)
+        except Exception: pass
+    finally:
+        try:
+            if channel is not None: channel.close()
+        except Exception: pass
+        try:
+            if client is not None: client.close()
+        except Exception: pass
+        if owner_id and actor_id and server_id:
+            try:
+                await asyncio.to_thread(store.audit, owner_id, actor_id, 'ssh_terminal_close', f'server:{server_id}', 'Interactive SSH session closed')
+            except Exception:
+                log.exception('SSH terminal audit failed')

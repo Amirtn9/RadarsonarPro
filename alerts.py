@@ -8,6 +8,10 @@ This module handles:
 """
 
 import logging
+import re
+
+def escape_markdown(text, version=1):
+    return re.sub(r'([_*`\[])', r'\\\1', str(text))
 
 # ✅ یکبار import logging (در اول فایل)
 # ✅ یکبار تعریف logger (بعد از import)
@@ -108,55 +112,51 @@ class AlertManager:
 
     @staticmethod
     def get_down_alert_msg(server_name, error, extra_note=""):
-        """
-        تولید متن پیام قطع شدن سرور (CRITICAL).
-        
-        Args:
-            server_name: نام سرور
-            error:  متن خطا
-            extra_note: نکته اضافی (اختیاری)
-        
-        Returns:
-            متن پیام آماده برای ارسال
-        """
-        try: 
-            msg = (
-                f"🚨 **هشدار قطع اتصال (CRITICAL)**\n"
-                f"🖥 سرور: `{server_name}`\n"
-                f"➖➖➖➖➖➖➖➖➖➖\n"
-                f"❌ وضعیت: **عدم دسترسی کامل**\n"
-                f"🔍 خطا: `{error}`"
-                f"{extra_note}"
-            )
-            logger.warning(f"🚨 Server down alert for {server_name}:  {error}")
-            return msg
-        except Exception as e:
-            logger.error(f"❌ Error generating down alert message: {e}", exc_info=True)
-            return f"🚨 خطا در تولید هشدار برای {server_name}"
+        """Telegram Markdown alert for a confirmed host outage."""
+        name = escape_markdown(str(server_name), version=1)
+        detail = escape_markdown(str(error), version=1)
+        note = escape_markdown(str(extra_note), version=1)
+        return (
+            f"❌ **قطعی سرور**\\n"
+            f"🖥 سرور: {name}\\n"
+            f"━━━━━━━━━━━━━━━━━━\\n"
+            f"وضعیت: **عدم دسترسی**\\n"
+            f"جزئیات: {detail}{note}"
+        )
 
     @staticmethod
     def get_recovery_msg(server_name):
-        """
-        تولید متن پیام وصل شدن مجدد سرور (RECOVERY).
-        
-        Args:
-            server_name: نام سرور
-        
-        Returns:
-            متن پیام آماده برای ارسال
-        """
-        try:
-            msg = (
-                f"✅ **اتصال برقرار شد (RECOVERY)**\n"
-                f"🖥 سرور: `{server_name}`\n"
-                f"➖➖➖➖➖➖➖➖➖➖\n"
-                f"♻️ سرور مجدداً در دسترس قرار گرفت."
-            )
-            logger.info(f"✅ Server recovery alert for {server_name}")
-            return msg
-        except Exception as e:
-            logger.error(f"❌ Error generating recovery message: {e}", exc_info=True)
-            return f"✅ خطا در تولید پیام بازگشت برای {server_name}"
+        """Telegram Markdown recovery alert."""
+        name = escape_markdown(str(server_name), version=1)
+        return (
+            f"✅ **اتصال سرور بازیابی شد**\\n"
+            f"🖥 سرور: {name}\\n"
+            f"━━━━━━━━━━━━━━━━━━\\n"
+            f"♻️ سرور مجدداً در دسترس است."
+        )
+
+    @staticmethod
+    def get_agent_down_msg(server_name, error="Agent is not responding"):
+        name = escape_markdown(str(server_name), version=1)
+        detail = escape_markdown(str(error), version=1)
+        return (
+            f"❌ **Agent سرور قطع است**\\n"
+            f"🖥 سرور: {name}\\n"
+            f"━━━━━━━━━━━━━━━━━━\\n"
+            f"وضعیت خود سرور: **Online از طریق SSH**\\n"
+            f"وضعیت Agent: **Offline**\\n"
+            f"جزئیات: {detail}"
+        )
+
+    @staticmethod
+    def get_agent_recovery_msg(server_name):
+        name = escape_markdown(str(server_name), version=1)
+        return (
+            f"✅ **Agent سرور مجدداً متصل شد**\\n"
+            f"🖥 سرور: {name}\\n"
+            f"━━━━━━━━━━━━━━━━━━\\n"
+            f"دریافت آمار زنده از Agent برقرار شد."
+        )
 
     @staticmethod
     def get_tunnel_fail_msg(config_name):
@@ -202,6 +202,58 @@ class AlertManager:
         except Exception as e:
             logger.error(f"❌ Error generating tunnel recovery message: {e}", exc_info=True)
             return f"✅ خطا در تولید پیام بازگشت برای {config_name}"
+
+
+def format_periodic_server_report(servers, timestamp):
+    """Build a compact, readable report from the latest stored server samples.
+
+    Each item may contain name/status/cpu/ram/agent_status. Missing metrics are
+    shown as unknown rather than fabricated as zero.
+    """
+    rows = [dict(item) for item in (servers or [])]
+    measured = []
+    for item in rows:
+        try:
+            cpu, ram = float(item.get('cpu')), float(item.get('ram'))
+            if str(item.get('status') or '').lower() == 'online' and 0 <= cpu <= 100 and 0 <= ram <= 100:
+                measured.append((item, (cpu + ram) / 2))
+        except (TypeError, ValueError):
+            continue
+    best = min(measured, key=lambda pair: pair[1]) if measured else None
+    lines = [
+        "📊 **گزارش دوره‌ای سرورها**",
+        f"🕒 {escape_markdown(str(timestamp), version=1)}",
+        "",
+        f"🖥 تعداد سرورها: **{len(rows)}**",
+    ]
+    if best:
+        lines.append(
+            "🏆 کم‌مصرف‌ترین سرور ثبت‌شده: "
+            f"**{escape_markdown(str(best[0].get('name') or 'بدون نام'), version=1)}** "
+            f"| میانگین CPU/RAM: **{best[1]:.1f}%**"
+        )
+    lines.extend([
+        "ℹ️ رتبه‌بندی براساس آخرین نمونه ثبت‌شده است، نه تست زنده سرعت.",
+        "",
+    ])
+    for item in rows:
+        name = escape_markdown(str(item.get('name') or 'بدون نام'), version=1)
+        status = str(item.get('status') or 'Unknown').lower()
+        icon = '🟢' if status == 'online' else ('❌' if status == 'offline' else '⚪')
+        status_text = 'Online' if status == 'online' else ('Offline' if status == 'offline' else 'Unknown')
+        agent = str(item.get('agent_status') or 'Unknown').lower()
+        agent_text = 'Online' if agent == 'online' else ('Offline' if agent == 'offline' else 'Unknown')
+        def metric(key):
+            try:
+                value = float(item.get(key))
+                return f"{value:.1f}%"
+            except (TypeError, ValueError):
+                return '—'
+        lines.append(
+            f"{icon} **{name}** | {status_text} | "
+            f"CPU {metric('cpu')} | RAM {metric('ram')} | Agent {agent_text}"
+        )
+    return "\\n".join(lines)
 
 
 # ==============================================================================

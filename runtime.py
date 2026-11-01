@@ -29,7 +29,11 @@ from typing import Any, Callable, TypeVar
 logger = logging.getLogger(__name__)
 
 # تعداد ورکرها از env قابل تنظیم است (برای سرورهای کوچک می‌توان کم کرد)
-MAX_WORKERS = int(os.getenv("SONAR_EXECUTOR_WORKERS", "48"))
+# Keep the default proportional to the host size; a fixed 48-thread pool
+# caused excessive runnable threads on small VPS instances. Operators can
+# override this explicitly with SONAR_EXECUTOR_WORKERS.
+_DEFAULT_WORKERS = min(16, max(4, (os.cpu_count() or 2) * 4))
+MAX_WORKERS = max(2, min(64, int(os.getenv("SONAR_EXECUTOR_WORKERS", str(_DEFAULT_WORKERS)))))
 
 SHARED_EXECUTOR = ThreadPoolExecutor(
     max_workers=MAX_WORKERS,
