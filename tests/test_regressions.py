@@ -170,3 +170,62 @@ def test_forged_admin_and_foreign_resource_callbacks_denied(monkeypatch):
     assert sec._access_sync(15,'act_reboot_4','server_actions')
     assert not sec._access_sync(15,'get_sub_links_12','get_sub_links_action')
     assert sec._access_sync(777,'admin_u_ban_20','admin_user_actions')
+
+
+def test_periodic_monitor_has_bounded_concurrency_and_recovery_notification():
+    source = (ROOT/'cronjobs.py').read_text()
+    assert '_GLOBAL_MONITOR_RUNNING' in source
+    assert 'asyncio.Semaphore(5)' in source
+    assert 'AlertManager.get_recovery_msg(name)' in source
+    assert 'logger.exception("Could not deliver administrator alert")' in source
+
+
+def test_stats_manager_separates_agent_and_host_status():
+    source = (ROOT/'server_stats.py').read_text()
+    assert "ws_res['agent_status'] = 'Online'" in source
+    assert "ssh_res['agent_status'] = 'Offline'" in source
+    assert "ssh_res['status_source'] = 'ssh'" in source
+
+
+def test_web_terminal_has_signed_auth_and_owner_checks():
+    source = (ROOT/'pro_portal.py').read_text()
+    assert "@app.websocket('/api/terminal')" in source
+    assert 'verify_init_data(init_data, get_bot_token())' in source
+    assert "store.require, actor_id, owner_id, True" in source
+    assert 'ServerMonitor.get_ssh_client' in source
+    assert "'ssh_terminal_open'" in source
+
+
+def test_periodic_report_uses_red_cross_for_offline_and_keeps_agent_separate():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('sonar_alerts_test', ROOT/'alerts.py')
+    module = importlib.util.module_from_spec(spec)
+    # telegram is installed in the project environment; tests only use formatter.
+    spec.loader.exec_module(module)
+    report = module.format_periodic_server_report([
+        {'name':'node_a','status':'Offline','cpu':0,'ram':0,'agent_status':'Offline'},
+        {'name':'node_b','status':'Online','cpu':20,'ram':30,'agent_status':'Offline'},
+    ], '10 آبان 1405 | 16:25')
+    assert r'❌ **node\_a** | Offline' in report
+    assert r'🟢 **node\_b** | Online' in report
+    assert 'Agent Offline' in report
+    assert 'کم‌مصرف‌ترین سرور ثبت‌شده' in report
+
+
+def test_agent_outage_is_tracked_separately_from_server_outage():
+    source = (ROOT/'cronjobs.py').read_text()
+    assert "AGENT_FAILURE_COUNTS = {}" in source
+    assert "AlertManager.get_agent_down_msg(" in source
+    assert "AlertManager.get_agent_recovery_msg(name)" in source
+    assert "'agent_down'" in source
+
+
+def test_shared_executor_default_scales_with_cpu_count():
+    source = (ROOT/'runtime.py').read_text()
+    assert '_DEFAULT_WORKERS = min(16, max(4, (os.cpu_count() or 2) * 4))' in source
+    assert 'SONAR_EXECUTOR_WORKERS' in source
+
+
+def test_stats_fallback_initializes_agent_probe_result_before_try():
+    source = (ROOT/'server_stats.py').read_text()
+    assert source.index('ws_res = {}') < source.index('try:', source.index('ws_res = {}'))
